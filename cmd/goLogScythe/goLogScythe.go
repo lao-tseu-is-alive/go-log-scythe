@@ -8,6 +8,7 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"context"
 	"fmt"
 	"io"
@@ -54,16 +55,100 @@ type Config struct {
 }
 
 type Visitor struct {
+	IP       string
 	Count    int
 	LastSeen time.Time
 }
 
+// LRUCache is a bounded cache with LRU eviction policy
+type LRUCache struct {
+	capacity int
+	items    map[string]*list.Element
+	order    *list.List // Front = most recently used
+}
+
+// NewLRUCache creates a new LRU cache with the given capacity
+func NewLRUCache(capacity int) *LRUCache {
+	return &LRUCache{
+		capacity: capacity,
+		items:    make(map[string]*list.Element),
+		order:    list.New(),
+	}
+}
+
+// Get retrieves a visitor from the cache and marks it as recently used
+func (c *LRUCache) Get(ip string) (*Visitor, bool) {
+	if elem, ok := c.items[ip]; ok {
+		c.order.MoveToFront(elem)
+		return elem.Value.(*Visitor), true
+	}
+	return nil, false
+}
+
+// Put adds or updates a visitor in the cache
+func (c *LRUCache) Put(ip string, visitor *Visitor) {
+	if elem, ok := c.items[ip]; ok {
+		c.order.MoveToFront(elem)
+		elem.Value = visitor
+		return
+	}
+
+	// Evict oldest if at capacity
+	if c.order.Len() >= c.capacity {
+		c.evictOldest()
+	}
+
+	elem := c.order.PushFront(visitor)
+	c.items[ip] = elem
+}
+
+// Delete removes a visitor from the cache
+func (c *LRUCache) Delete(ip string) {
+	if elem, ok := c.items[ip]; ok {
+		c.order.Remove(elem)
+		delete(c.items, ip)
+	}
+}
+
+// evictOldest removes the least recently used item
+func (c *LRUCache) evictOldest() {
+	if elem := c.order.Back(); elem != nil {
+		visitor := elem.Value.(*Visitor)
+		c.order.Remove(elem)
+		delete(c.items, visitor.IP)
+	}
+}
+
+// Len returns the number of items in the cache
+func (c *LRUCache) Len() int {
+	return c.order.Len()
+}
+
+// CleanExpired removes entries older than the given window
+func (c *LRUCache) CleanExpired(window time.Duration) int {
+	removed := 0
+	now := time.Now()
+
+	// Iterate from back (oldest) to front
+	for elem := c.order.Back(); elem != nil; {
+		visitor := elem.Value.(*Visitor)
+		prev := elem.Prev()
+		if now.Sub(visitor.LastSeen) > window {
+			c.order.Remove(elem)
+			delete(c.items, visitor.IP)
+			removed++
+		}
+		elem = prev
+	}
+	return removed
+}
+
 var (
-	conf      Config
-	visitors  = make(map[string]*Visitor)
-	banned    = make(map[string]bool)
-	whitelist = make(map[string]bool)
-	mu        sync.Mutex
+	conf         Config
+	visitorCache *LRUCache
+	banned       = make(map[string]bool)
+	whitelist    = make(map[string]bool)
+	mu           sync.Mutex
 
 	reLog      *regexp.Regexp
 	reOverride *regexp.Regexp
@@ -94,6 +179,9 @@ func init() {
 			log.Fatalf("❌ FATAL: REGEX_OVERRIDE is invalid: %v", err)
 		}
 	}
+
+	// Initialize LRU cache for visitor tracking
+	visitorCache = NewLRUCache(maxVisitors)
 }
 
 func main() {
@@ -226,42 +314,18 @@ func processLine(line string) {
 		return
 	}
 
-	// Bounded map: evict oldest if at capacity
-	if len(visitors) >= maxVisitors {
-		evictOldestVisitor()
-	}
-
-	v, exists := visitors[ip]
+	// Use LRU cache for visitor tracking (auto-evicts oldest when full)
+	v, exists := visitorCache.Get(ip)
 	if !exists {
-		v = &Visitor{}
-		visitors[ip] = v
+		v = &Visitor{IP: ip}
 	}
 	v.Count++
 	v.LastSeen = time.Now()
+	visitorCache.Put(ip, v)
 
 	if v.Count >= conf.Threshold {
 		executeBan(ip)
-		delete(visitors, ip)
-	}
-}
-
-// evictOldestVisitor removes the visitor with the oldest LastSeen time
-// Must be called while holding mu lock
-func evictOldestVisitor() {
-	var oldestIP string
-	var oldestTime time.Time
-	first := true
-
-	for ip, v := range visitors {
-		if first || v.LastSeen.Before(oldestTime) {
-			oldestIP = ip
-			oldestTime = v.LastSeen
-			first = false
-		}
-	}
-
-	if oldestIP != "" {
-		delete(visitors, oldestIP)
+		visitorCache.Delete(ip)
 	}
 }
 
@@ -475,7 +539,11 @@ func loadAndSyncBannedList() {
 				if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
 					setName = conf.NftSetNameV6
 				}
-				exec.Command("nft", "add", "element", "inet", "filter", setName, "{", ip, "}").Run()
+				cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", ip, "}")
+				if err := cmd.Run(); err != nil {
+					// Note: nft returns error if IP already in set, which is fine
+					log.Printf("⚠️  WARN: nft add element for %s: %v (may already exist)", ip, err)
+				}
 			}
 			mu.Unlock()
 		}
@@ -492,11 +560,7 @@ func janitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 			mu.Lock()
-			for ip, v := range visitors {
-				if time.Since(v.LastSeen) > conf.Window {
-					delete(visitors, ip)
-				}
-			}
+			visitorCache.CleanExpired(conf.Window)
 			mu.Unlock()
 		}
 	}

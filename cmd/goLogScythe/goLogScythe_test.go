@@ -240,52 +240,109 @@ func TestTryMatch(t *testing.T) {
 	}
 }
 
-// --- Visitor Eviction Tests ---
+// --- LRU Cache Tests ---
 
-func TestEvictOldestVisitor(t *testing.T) {
-	// Reset global state
-	mu.Lock()
-	visitors = make(map[string]*Visitor)
+func TestLRUCacheBasicOperations(t *testing.T) {
+	cache := NewLRUCache(3)
 
-	// Create visitors with different timestamps
-	now := time.Now()
-	visitors["192.168.1.1"] = &Visitor{Count: 5, LastSeen: now}
-	visitors["192.168.1.2"] = &Visitor{Count: 3, LastSeen: now.Add(-10 * time.Minute)} // Oldest
-	visitors["192.168.1.3"] = &Visitor{Count: 7, LastSeen: now.Add(-5 * time.Minute)}
+	// Test Put and Get
+	cache.Put("192.168.1.1", &Visitor{IP: "192.168.1.1", Count: 1})
+	cache.Put("192.168.1.2", &Visitor{IP: "192.168.1.2", Count: 2})
 
-	evictOldestVisitor()
-
-	// Check that the oldest was removed
-	if _, exists := visitors["192.168.1.2"]; exists {
-		t.Error("evictOldestVisitor() did not remove the oldest visitor")
+	v, ok := cache.Get("192.168.1.1")
+	if !ok {
+		t.Error("LRUCache.Get() should find existing key")
+	}
+	if v.Count != 1 {
+		t.Errorf("LRUCache.Get() count = %d, want 1", v.Count)
 	}
 
-	// Check that others remain
-	if _, exists := visitors["192.168.1.1"]; !exists {
-		t.Error("evictOldestVisitor() incorrectly removed 192.168.1.1")
-	}
-	if _, exists := visitors["192.168.1.3"]; !exists {
-		t.Error("evictOldestVisitor() incorrectly removed 192.168.1.3")
+	// Test non-existent key
+	_, ok = cache.Get("nonexistent")
+	if ok {
+		t.Error("LRUCache.Get() should return false for non-existent key")
 	}
 
-	if len(visitors) != 2 {
-		t.Errorf("evictOldestVisitor() left %d visitors, want 2", len(visitors))
+	// Test Len
+	if cache.Len() != 2 {
+		t.Errorf("LRUCache.Len() = %d, want 2", cache.Len())
 	}
-
-	mu.Unlock()
 }
 
-func TestEvictOldestVisitorEmptyMap(t *testing.T) {
-	mu.Lock()
-	visitors = make(map[string]*Visitor)
+func TestLRUCacheEviction(t *testing.T) {
+	cache := NewLRUCache(3)
 
-	// Should not panic on empty map
-	evictOldestVisitor()
+	// Fill cache
+	cache.Put("ip1", &Visitor{IP: "ip1", Count: 1})
+	cache.Put("ip2", &Visitor{IP: "ip2", Count: 2})
+	cache.Put("ip3", &Visitor{IP: "ip3", Count: 3})
 
-	if len(visitors) != 0 {
-		t.Errorf("evictOldestVisitor() on empty map resulted in %d visitors", len(visitors))
+	// Access ip1 to make it most recently used
+	cache.Get("ip1")
+
+	// Add ip4, should evict ip2 (least recently used)
+	cache.Put("ip4", &Visitor{IP: "ip4", Count: 4})
+
+	if cache.Len() != 3 {
+		t.Errorf("LRUCache should maintain capacity, got len=%d", cache.Len())
 	}
-	mu.Unlock()
+
+	// ip2 should be evicted
+	_, ok := cache.Get("ip2")
+	if ok {
+		t.Error("ip2 should have been evicted")
+	}
+
+	// ip1, ip3, ip4 should exist
+	if _, ok := cache.Get("ip1"); !ok {
+		t.Error("ip1 should exist")
+	}
+	if _, ok := cache.Get("ip3"); !ok {
+		t.Error("ip3 should exist")
+	}
+	if _, ok := cache.Get("ip4"); !ok {
+		t.Error("ip4 should exist")
+	}
+}
+
+func TestLRUCacheDelete(t *testing.T) {
+	cache := NewLRUCache(3)
+	cache.Put("ip1", &Visitor{IP: "ip1", Count: 1})
+	cache.Put("ip2", &Visitor{IP: "ip2", Count: 2})
+
+	cache.Delete("ip1")
+
+	if cache.Len() != 1 {
+		t.Errorf("After delete, len = %d, want 1", cache.Len())
+	}
+
+	if _, ok := cache.Get("ip1"); ok {
+		t.Error("Deleted key should not exist")
+	}
+}
+
+func TestLRUCacheCleanExpired(t *testing.T) {
+	cache := NewLRUCache(10)
+	now := time.Now()
+
+	// Add entries with different ages
+	cache.Put("new", &Visitor{IP: "new", LastSeen: now})
+	cache.Put("old", &Visitor{IP: "old", LastSeen: now.Add(-20 * time.Minute)})
+	cache.Put("ancient", &Visitor{IP: "ancient", LastSeen: now.Add(-1 * time.Hour)})
+
+	removed := cache.CleanExpired(15 * time.Minute)
+
+	if removed != 2 {
+		t.Errorf("CleanExpired should remove 2 entries, removed %d", removed)
+	}
+
+	if cache.Len() != 1 {
+		t.Errorf("After cleanup, len = %d, want 1", cache.Len())
+	}
+
+	if _, ok := cache.Get("new"); !ok {
+		t.Error("'new' entry should still exist")
+	}
 }
 
 // --- Whitelist Loading Tests ---
@@ -342,7 +399,7 @@ func TestProcessLine(t *testing.T) {
 	// Reset global state for each test
 	resetGlobalState := func() {
 		mu.Lock()
-		visitors = make(map[string]*Visitor)
+		visitorCache = NewLRUCache(maxVisitors)
 		banned = make(map[string]bool)
 		whitelist = make(map[string]bool)
 		whitelist["127.0.0.1"] = true
@@ -353,7 +410,7 @@ func TestProcessLine(t *testing.T) {
 		resetGlobalState()
 		processLine("")
 		mu.Lock()
-		if len(visitors) != 0 {
+		if visitorCache.Len() != 0 {
 			t.Error("processLine() should ignore empty lines")
 		}
 		mu.Unlock()
@@ -364,7 +421,7 @@ func TestProcessLine(t *testing.T) {
 		line := `127.0.0.1 - - [16/Jan/2026:10:00:00 +0000] "GET /admin HTTP/1.1" 404 123`
 		processLine(line)
 		mu.Lock()
-		if _, exists := visitors["127.0.0.1"]; exists {
+		if _, exists := visitorCache.Get("127.0.0.1"); exists {
 			t.Error("processLine() should skip whitelisted IPs")
 		}
 		mu.Unlock()
@@ -375,7 +432,7 @@ func TestProcessLine(t *testing.T) {
 		line := `8.8.8.8 - - [16/Jan/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 1024`
 		processLine(line)
 		mu.Lock()
-		if _, exists := visitors["8.8.8.8"]; exists {
+		if _, exists := visitorCache.Get("8.8.8.8"); exists {
 			t.Error("processLine() should ignore non-4xx status codes")
 		}
 		mu.Unlock()
@@ -386,7 +443,7 @@ func TestProcessLine(t *testing.T) {
 		line := `192.168.1.50 - - [16/Jan/2026:10:00:00 +0000] "GET /admin HTTP/1.1" 404 123`
 		processLine(line)
 		mu.Lock()
-		v, exists := visitors["192.168.1.50"]
+		v, exists := visitorCache.Get("192.168.1.50")
 		if !exists {
 			t.Fatal("processLine() did not create visitor entry")
 		}
@@ -406,7 +463,7 @@ func TestProcessLine(t *testing.T) {
 		processLine(line)
 
 		mu.Lock()
-		if _, exists := visitors["10.0.0.99"]; exists {
+		if _, exists := visitorCache.Get("10.0.0.99"); exists {
 			t.Error("processLine() should skip already banned IPs")
 		}
 		mu.Unlock()
@@ -555,7 +612,7 @@ func TestLoadAndSyncBannedListWithIPv6(t *testing.T) {
 func TestScanFullLog(t *testing.T) {
 	// Reset global state
 	mu.Lock()
-	visitors = make(map[string]*Visitor)
+	visitorCache = NewLRUCache(maxVisitors)
 	banned = make(map[string]bool)
 	whitelist = make(map[string]bool)
 	whitelist["127.0.0.1"] = true
