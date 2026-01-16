@@ -427,9 +427,11 @@ func loadSafetyWhitelist() {
 
 	// Import current SSH Session
 	if ssh := os.Getenv("SSH_CONNECTION"); ssh != "" {
-		ip := strings.Fields(ssh)[0]
-		log.Printf("🛡️  SAFETY: Whitelisting current SSH session IP: %s", ip)
-		whitelist[ip] = true
+		fields := strings.Fields(ssh)
+		if len(fields) > 0 && isValidIP(fields[0]) {
+			log.Printf("🛡️  SAFETY: Whitelisting current SSH session IP: %s", fields[0])
+			whitelist[fields[0]] = true
+		}
 	}
 
 	// Import from File
@@ -469,7 +471,11 @@ func loadAndSyncBannedList() {
 			mu.Lock()
 			if !banned[ip] {
 				banned[ip] = true
-				exec.Command("nft", "add", "element", "inet", "filter", conf.NftSetName, "{", ip, "}").Run()
+				setName := conf.NftSetName
+				if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+					setName = conf.NftSetNameV6
+				}
+				exec.Command("nft", "add", "element", "inet", "filter", setName, "{", ip, "}").Run()
 			}
 			mu.Unlock()
 		}
