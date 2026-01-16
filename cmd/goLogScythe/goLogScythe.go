@@ -8,16 +8,19 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -29,14 +32,12 @@ const (
 	defaultThreshold     = 10
 	defaultWindow        = 15 * time.Minute
 	defaultNftSet        = "parasites"
+	defaultNftSetV6      = "parasites6"
+	maxVisitors          = 10000 // Maximum visitors to track before eviction
 
-	// Standard Nginx/Apache Combined Log Format Regex
+	// Combined Log Format Regex (works for both Nginx and Apache)
 	// Matches: 1.2.3.4 - - [Date] "Request" 404 ...
-	defaultNginxRegex = `^(\S+)\s+-\s+-\s+\[.*?\]\s+".*?"\s+(\d{3})`
-
-	// Apache specific or custom gawk format fallback
-	// Matches: 78.153.140.156 - - [15/Jan/2026:00:48:46 +0100] ...
-	defaultApacheRegex = `^(\S+)\s+-\s+-\s+\[.*?\]\s+".*?"\s+(\d{3})`
+	defaultLogRegex = `^(\S+)\s+-\s+-\s+\[.*?\]\s+".*?"\s+(\d{3})`
 )
 
 type Config struct {
@@ -46,8 +47,10 @@ type Config struct {
 	Threshold     int
 	Window        time.Duration
 	NftSetName    string
+	NftSetNameV6  string
 	RegexOverride string
 	PreviewMode   bool
+	ScanAllMode   bool
 }
 
 type Visitor struct {
@@ -62,8 +65,7 @@ var (
 	whitelist = make(map[string]bool)
 	mu        sync.Mutex
 
-	reNginx    *regexp.Regexp
-	reApache   *regexp.Regexp
+	reLog      *regexp.Regexp
 	reOverride *regexp.Regexp
 )
 
@@ -76,13 +78,14 @@ func init() {
 		Threshold:     getEnvInt("BAN_THRESHOLD", defaultThreshold),
 		Window:        getEnvDuration("BAN_WINDOW", defaultWindow),
 		NftSetName:    getEnv("NFT_SET_NAME", defaultNftSet),
+		NftSetNameV6:  getEnv("NFT_SET_NAME_V6", defaultNftSetV6),
 		RegexOverride: os.Getenv("REGEX_OVERRIDE"),
 		PreviewMode:   getEnvBool("PREVIEW_MODE", false),
+		ScanAllMode:   getEnvBool("SCAN_ALL_MODE", false),
 	}
 
-	// Pre-compile Regexes
-	reNginx = regexp.MustCompile(defaultNginxRegex)
-	reApache = regexp.MustCompile(defaultApacheRegex)
+	// Pre-compile Regex
+	reLog = regexp.MustCompile(defaultLogRegex)
 
 	if conf.RegexOverride != "" {
 		var err error
@@ -98,6 +101,20 @@ func main() {
 	if conf.PreviewMode {
 		fmt.Println("🔍 PREVIEW MODE: No real bans will be issued.")
 	}
+	if conf.ScanAllMode {
+		fmt.Println("📊 SCAN ALL MODE: Reading entire log file...")
+	}
+
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("\n🛑 Received %v, shutting down gracefully...", sig)
+		cancel()
+	}()
 
 	// 1. Safety Phase
 	loadSafetyWhitelist()
@@ -107,14 +124,22 @@ func main() {
 		loadAndSyncBannedList()
 	}
 
-	// 3. Maintenance Phase
-	go janitor()
+	// 3. Scan All Mode - process entire log file first
+	if conf.ScanAllMode {
+		scanFullLog(conf.LogPath)
+		return // Exit after scan in this mode
+	}
 
-	// 4. Execution Phase
-	tailLog(conf.LogPath)
+	// 4. Maintenance Phase (only for tail mode)
+	go janitor(ctx)
+
+	// 5. Execution Phase
+	tailLog(ctx, conf.LogPath)
+
+	log.Println("✅ LogScythe stopped.")
 }
 
-func tailLog(path string) {
+func tailLog(ctx context.Context, path string) {
 	file, err := os.Open(path)
 	if err != nil {
 		log.Fatalf("❌ FATAL: Cannot open log: %v", err)
@@ -128,6 +153,13 @@ func tailLog(path string) {
 	fmt.Printf("📖 Monitoring %s from offset %d...\n", path, offset)
 
 	for {
+		// Check for shutdown
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -169,14 +201,9 @@ func processLine(line string) {
 		}
 	}
 
-	// 2. Try Nginx then Apache
+	// 2. Try default log regex
 	if !matched {
-		ip, status, matched = tryMatch(reNginx, line)
-	}
-
-	// Strategy C: Apache Fallback
-	if !matched {
-		ip, status, matched = tryMatch(reApache, line)
+		ip, status, matched = tryMatch(reLog, line)
 	}
 
 	if !matched || !isValidIP(ip) {
@@ -199,6 +226,11 @@ func processLine(line string) {
 		return
 	}
 
+	// Bounded map: evict oldest if at capacity
+	if len(visitors) >= maxVisitors {
+		evictOldestVisitor()
+	}
+
 	v, exists := visitors[ip]
 	if !exists {
 		v = &Visitor{}
@@ -213,6 +245,26 @@ func processLine(line string) {
 	}
 }
 
+// evictOldestVisitor removes the visitor with the oldest LastSeen time
+// Must be called while holding mu lock
+func evictOldestVisitor() {
+	var oldestIP string
+	var oldestTime time.Time
+	first := true
+
+	for ip, v := range visitors {
+		if first || v.LastSeen.Before(oldestTime) {
+			oldestIP = ip
+			oldestTime = v.LastSeen
+			first = false
+		}
+	}
+
+	if oldestIP != "" {
+		delete(visitors, oldestIP)
+	}
+}
+
 func executeBan(ip string) {
 	if conf.PreviewMode {
 		log.Printf("👀 [PREVIEW] Would ban IP: %s (%d hits)", ip, conf.Threshold)
@@ -220,10 +272,18 @@ func executeBan(ip string) {
 		return
 	}
 
+	// Determine if IPv4 or IPv6
+	parsedIP := net.ParseIP(ip)
+	setName := conf.NftSetName
+	if parsedIP != nil && parsedIP.To4() == nil {
+		// IPv6 address
+		setName = conf.NftSetNameV6
+	}
+
 	// 1. Kernel Action
-	cmd := exec.Command("nft", "add", "element", "inet", "filter", conf.NftSetName, "{", ip, "}")
+	cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", ip, "}")
 	if err := cmd.Run(); err != nil {
-		log.Printf("❌ ERROR: Failed to ban %s in nftables: %v", ip, err)
+		log.Printf("❌ ERROR: Failed to ban %s in nftables set %s: %v", ip, setName, err)
 		return
 	}
 
@@ -232,10 +292,119 @@ func executeBan(ip string) {
 	f, err := os.OpenFile(conf.BannedPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err == nil {
 		defer f.Close()
-		f.WriteString(ip + "\n")
+		if _, err := f.WriteString(ip + "\n"); err != nil {
+			log.Printf("⚠️  WARN: Failed to persist ban for %s: %v", ip, err)
+		}
 	}
 
-	log.Printf("🚫 BANNED: %s", ip)
+	log.Printf("🚫 BANNED: %s (set: %s)", ip, setName)
+}
+
+// scanFullLog reads the entire log file and processes all lines
+func scanFullLog(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("❌ FATAL: Cannot open log: %v", err)
+	}
+	defer file.Close()
+
+	fmt.Printf("📖 Scanning %s...\n", path)
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	// Statistics
+	totalLines := 0
+	parsedOK := 0
+	total4xx := 0
+	ipHits := make(map[string]int) // IP -> 4xx hit count
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		totalLines++
+
+		if line == "" {
+			continue
+		}
+
+		var ip, status string
+		var matched bool
+
+		// Try override regex first
+		if reOverride != nil {
+			ip, status, matched = tryMatch(reOverride, line)
+		}
+
+		// Try default log regex
+		if !matched {
+			ip, status, matched = tryMatch(reLog, line)
+		}
+
+		if !matched || !isValidIP(ip) {
+			continue
+		}
+
+		parsedOK++
+
+		// Count 4xx errors
+		if strings.HasPrefix(status, "4") {
+			total4xx++
+			ipHits[ip]++
+		}
+	}
+
+	// Collect IPs that exceed threshold
+	type ipStat struct {
+		ip   string
+		hits int
+	}
+	var toBan []ipStat
+	uniqueIPs := 0
+
+	for ip, hits := range ipHits {
+		uniqueIPs++
+		if hits >= conf.Threshold {
+			// Skip whitelisted IPs
+			if whitelist[ip] {
+				continue
+			}
+			// Skip already banned IPs
+			if banned[ip] {
+				continue
+			}
+			toBan = append(toBan, ipStat{ip, hits})
+		}
+	}
+
+	// Sort by hits descending
+	for i := 0; i < len(toBan)-1; i++ {
+		for j := i + 1; j < len(toBan); j++ {
+			if toBan[j].hits > toBan[i].hits {
+				toBan[i], toBan[j] = toBan[j], toBan[i]
+			}
+		}
+	}
+
+	// Print results
+	fmt.Println("📊 Scan Results:")
+	fmt.Printf("   Total lines: %d\n", totalLines)
+	fmt.Printf("   Parsed OK: %d\n", parsedOK)
+	fmt.Printf("   4xx errors: %d\n", total4xx)
+	fmt.Printf("   Unique IPs with 4xx: %d\n", uniqueIPs)
+	fmt.Printf("   IPs exceeding threshold (%d): %d\n", conf.Threshold, len(toBan))
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	// Process IPs
+	for _, stat := range toBan {
+		if conf.PreviewMode {
+			fmt.Printf("👀 [PREVIEW] Would ban: %s (%d hits)\n", stat.ip, stat.hits)
+		} else {
+			executeBan(stat.ip)
+		}
+	}
+
+	if len(toBan) == 0 {
+		fmt.Println("✅ No IPs exceed the ban threshold.")
+	}
 }
 
 // --- Internal Utilities ---
@@ -296,25 +465,34 @@ func loadAndSyncBannedList() {
 	s := bufio.NewScanner(file)
 	for s.Scan() {
 		ip := strings.TrimSpace(s.Text())
-		if isValidIP(ip) && !banned[ip] {
+		if isValidIP(ip) {
 			mu.Lock()
-			banned[ip] = true
-			exec.Command("nft", "add", "element", "inet", "filter", conf.NftSetName, "{", ip, "}").Run()
+			if !banned[ip] {
+				banned[ip] = true
+				exec.Command("nft", "add", "element", "inet", "filter", conf.NftSetName, "{", ip, "}").Run()
+			}
 			mu.Unlock()
 		}
 	}
 }
 
-func janitor() {
+func janitor(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
 	for {
-		time.Sleep(2 * time.Minute)
-		mu.Lock()
-		for ip, v := range visitors {
-			if time.Since(v.LastSeen) > conf.Window {
-				delete(visitors, ip)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			mu.Lock()
+			for ip, v := range visitors {
+				if time.Since(v.LastSeen) > conf.Window {
+					delete(visitors, ip)
+				}
 			}
+			mu.Unlock()
 		}
-		mu.Unlock()
 	}
 }
 
