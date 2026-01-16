@@ -30,3 +30,7 @@ go.work.sum
 # Editor/IDE
 .idea/
 .vscode/
+/samples/nftables.conf
+/goLogScyth
+/logscythe
+/samples/history_20260116.txt

@@ -506,6 +506,10 @@ func janitor(ctx context.Context) {
 
 func getEnv(key, fallback string) string {
 	if val, ok := os.LookupEnv(key); ok {
+		// Strip surrounding quotes if present (common in .env files)
+		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
+			return val[1 : len(val)-1]
+		}
 		return val
 	}
 	return fallback
