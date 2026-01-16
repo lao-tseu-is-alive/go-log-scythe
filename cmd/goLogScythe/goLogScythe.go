@@ -297,8 +297,10 @@ func loadAndSyncBannedList() {
 	for s.Scan() {
 		ip := strings.TrimSpace(s.Text())
 		if isValidIP(ip) && !banned[ip] {
+			mu.Lock()
 			banned[ip] = true
 			exec.Command("nft", "add", "element", "inet", "filter", conf.NftSetName, "{", ip, "}").Run()
+			mu.Unlock()
 		}
 	}
 }
