@@ -1,0 +1,2 @@
+# go-log-scythe
+GoLogScythe
