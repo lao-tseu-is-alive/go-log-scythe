@@ -246,15 +246,15 @@ func TestLRUCacheBasicOperations(t *testing.T) {
 	cache := NewLRUCache(3)
 
 	// Test Put and Get
-	cache.Put("192.168.1.1", &Visitor{IP: "192.168.1.1", Count: 1})
-	cache.Put("192.168.1.2", &Visitor{IP: "192.168.1.2", Count: 2})
+	cache.Put("192.168.1.1", &Visitor{IP: "192.168.1.1", Score: 1.0, Paths: make(map[string]bool)})
+	cache.Put("192.168.1.2", &Visitor{IP: "192.168.1.2", Score: 2.0, Paths: make(map[string]bool)})
 
 	v, ok := cache.Get("192.168.1.1")
 	if !ok {
 		t.Error("LRUCache.Get() should find existing key")
 	}
-	if v.Count != 1 {
-		t.Errorf("LRUCache.Get() count = %d, want 1", v.Count)
+	if v.Score != 1.0 {
+		t.Errorf("LRUCache.Get() score = %.1f, want 1.0", v.Score)
 	}
 
 	// Test non-existent key
@@ -273,15 +273,15 @@ func TestLRUCacheEviction(t *testing.T) {
 	cache := NewLRUCache(3)
 
 	// Fill cache
-	cache.Put("ip1", &Visitor{IP: "ip1", Count: 1})
-	cache.Put("ip2", &Visitor{IP: "ip2", Count: 2})
-	cache.Put("ip3", &Visitor{IP: "ip3", Count: 3})
+	cache.Put("ip1", &Visitor{IP: "ip1", Score: 1.0, Paths: make(map[string]bool)})
+	cache.Put("ip2", &Visitor{IP: "ip2", Score: 2.0, Paths: make(map[string]bool)})
+	cache.Put("ip3", &Visitor{IP: "ip3", Score: 3.0, Paths: make(map[string]bool)})
 
 	// Access ip1 to make it most recently used
 	cache.Get("ip1")
 
 	// Add ip4, should evict ip2 (least recently used)
-	cache.Put("ip4", &Visitor{IP: "ip4", Count: 4})
+	cache.Put("ip4", &Visitor{IP: "ip4", Score: 4.0, Paths: make(map[string]bool)})
 
 	if cache.Len() != 3 {
 		t.Errorf("LRUCache should maintain capacity, got len=%d", cache.Len())
@@ -307,8 +307,8 @@ func TestLRUCacheEviction(t *testing.T) {
 
 func TestLRUCacheDelete(t *testing.T) {
 	cache := NewLRUCache(3)
-	cache.Put("ip1", &Visitor{IP: "ip1", Count: 1})
-	cache.Put("ip2", &Visitor{IP: "ip2", Count: 2})
+	cache.Put("ip1", &Visitor{IP: "ip1", Score: 1.0, Paths: make(map[string]bool)})
+	cache.Put("ip2", &Visitor{IP: "ip2", Score: 2.0, Paths: make(map[string]bool)})
 
 	cache.Delete("ip1")
 
@@ -447,8 +447,8 @@ func TestProcessLine(t *testing.T) {
 		if !exists {
 			t.Fatal("processLine() did not create visitor entry")
 		}
-		if v.Count != 1 {
-			t.Errorf("processLine() count = %d, want 1", v.Count)
+		if v.Score == 0 {
+			t.Errorf("processLine() score = %.1f, want > 0", v.Score)
 		}
 		mu.Unlock()
 	})
@@ -644,14 +644,14 @@ func TestScanFullLog(t *testing.T) {
 	// We're testing that the function correctly identifies IPs to ban
 	originalPath := conf.LogPath
 	originalPreview := conf.PreviewMode
-	originalThreshold := conf.Threshold
+	originalThreshold := conf.BanThreshold
 	conf.LogPath = logFile
 	conf.PreviewMode = false // Test will fail on nft but we check banned map first
-	conf.Threshold = 10
+	conf.BanThreshold = 10.0
 	defer func() {
 		conf.LogPath = originalPath
 		conf.PreviewMode = originalPreview
-		conf.Threshold = originalThreshold
+		conf.BanThreshold = originalThreshold
 	}()
 
 	// Note: In preview mode, scanFullLog prints but doesn't update banned map.
@@ -724,12 +724,12 @@ func TestScanFullLogWhitelistedIP(t *testing.T) {
 	}
 
 	originalPreview := conf.PreviewMode
-	originalThreshold := conf.Threshold
+	originalThreshold := conf.BanThreshold
 	conf.PreviewMode = true
-	conf.Threshold = 10
+	conf.BanThreshold = 10.0
 	defer func() {
 		conf.PreviewMode = originalPreview
-		conf.Threshold = originalThreshold
+		conf.BanThreshold = originalThreshold
 	}()
 
 	scanFullLog(logFile)

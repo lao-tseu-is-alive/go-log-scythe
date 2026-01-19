@@ -29,27 +29,39 @@ import (
 const (
 	APP                  = "goLogScythe"
 	AppSnake             = "go-log-scythe"
-	VERSION              = "0.1.1"
+	VERSION              = "0.2.0"
 	REPOSITORY           = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath       = "/var/log/nginx/access.log"
 	defaultWhitelistPath = "./whitelist.txt"
 	defaultBannedPath    = "./banned_ips.txt"
-	defaultThreshold     = 10
+	defaultRulesPath     = ""   // Empty means no rules file (backward compatible)
+	defaultThreshold     = 10.0 // Score threshold for banning
+	defaultRepeatPenalty = 0.1  // 10% of full score for repeat path hits
 	defaultWindow        = 15 * time.Minute
 	defaultNftSet        = "parasites"
 	defaultNftSetV6      = "parasites6"
 	maxVisitors          = 10000 // Maximum visitors to track before eviction
 
 	// Combined Log Format Regex (works for both Nginx and Apache)
-	// Matches: 1.2.3.4 - - [Date] "Request" 404 ...
-	defaultLogRegex = `^(\S+)\s+-\s+-\s+\[.*?\]\s+".*?"\s+(\d{3})`
+	// Matches: 1.2.3.4 - - [Date] "METHOD /path HTTP/x.x" 404 ...
+	// Group 1: IP, Group 2: URL path, Group 3: Status code
+	defaultLogRegex = `^(\S+)\s+-\s+-\s+\[.*?\]\s+"\S+\s+(\S+)\s+.*?"\s+(\d{3})`
 )
+
+// Rule represents a threat detection rule with a score and regex pattern
+type Rule struct {
+	Score   float64
+	Pattern *regexp.Regexp
+	Raw     string // Original pattern string for logging
+}
 
 type Config struct {
 	LogPath       string
 	WhitelistPath string
 	BannedPath    string
-	Threshold     int
+	RulesPath     string  // Path to rules.conf file
+	BanThreshold  float64 // Score threshold for banning (default: 10.0)
+	RepeatPenalty float64 // Score multiplier for repeat path hits (default: 0.1)
 	Window        time.Duration
 	NftSetName    string
 	NftSetNameV6  string
@@ -60,7 +72,8 @@ type Config struct {
 
 type Visitor struct {
 	IP       string
-	Count    int
+	Score    float64         // Cumulative danger score
+	Paths    map[string]bool // Track distinct paths for repeat penalty
 	LastSeen time.Time
 }
 
@@ -156,6 +169,7 @@ var (
 
 	reLog      *regexp.Regexp
 	reOverride *regexp.Regexp
+	rules      []Rule // Loaded threat detection rules
 )
 
 func init() {
@@ -164,7 +178,9 @@ func init() {
 		LogPath:       getEnv("LOG_PATH", defaultLogPath),
 		WhitelistPath: getEnv("WHITE_LIST_PATH", defaultWhitelistPath),
 		BannedPath:    getEnv("BANNED_FILE_PATH", defaultBannedPath),
-		Threshold:     getEnvInt("BAN_THRESHOLD", defaultThreshold),
+		RulesPath:     getEnv("RULES_PATH", defaultRulesPath),
+		BanThreshold:  getEnvFloat("BAN_THRESHOLD", defaultThreshold),
+		RepeatPenalty: getEnvFloat("REPEAT_PENALTY", defaultRepeatPenalty),
 		Window:        getEnvDuration("BAN_WINDOW", defaultWindow),
 		NftSetName:    getEnv("NFT_SET_NAME", defaultNftSet),
 		NftSetNameV6:  getEnv("NFT_SET_NAME_V6", defaultNftSetV6),
@@ -182,6 +198,11 @@ func init() {
 		if err != nil {
 			log.Fatalf("❌ FATAL: REGEX_OVERRIDE is invalid: %v", err)
 		}
+	}
+
+	// Load threat detection rules if configured
+	if conf.RulesPath != "" {
+		loadRules(conf.RulesPath)
 	}
 
 	// Initialize LRU cache for visitor tracking
@@ -239,12 +260,12 @@ func processLine(line string) {
 		return
 	}
 
-	var ip, status string
+	var ip, urlPath, status string
 	var matched bool
 
 	// 1. Try Override
 	if reOverride != nil {
-		ip, status, matched = tryMatch(reOverride, line)
+		ip, urlPath, status, matched = tryMatchWithPath(reOverride, line)
 		if matched && !isValidIP(ip) {
 			log.Fatalf("❌ FATAL: REGEX_OVERRIDE extracted invalid IP: %s", ip)
 		}
@@ -252,7 +273,7 @@ func processLine(line string) {
 
 	// 2. Try default log regex
 	if !matched {
-		ip, status, matched = tryMatch(reLog, line)
+		ip, urlPath, status, matched = tryMatchWithPath(reLog, line)
 	}
 
 	if !matched || !isValidIP(ip) {
@@ -273,24 +294,35 @@ func processLine(line string) {
 		return
 	}
 
+	// Calculate score for this path
+	pathScore := calculateScore(urlPath)
+
 	// Use LRU cache for visitor tracking (auto-evicts oldest when full)
 	v, exists := visitorCache.Get(ip)
 	if !exists {
-		v = &Visitor{IP: ip}
+		v = &Visitor{IP: ip, Paths: make(map[string]bool)}
 	}
-	v.Count++
+
+	// Apply repeat penalty if this path was already seen
+	if v.Paths[urlPath] {
+		pathScore *= conf.RepeatPenalty
+	} else {
+		v.Paths[urlPath] = true
+	}
+
+	v.Score += pathScore
 	v.LastSeen = time.Now()
 	visitorCache.Put(ip, v)
 
-	if v.Count >= conf.Threshold {
-		executeBan(ip)
+	if v.Score >= conf.BanThreshold {
+		executeBan(ip, v.Score)
 		visitorCache.Delete(ip)
 	}
 }
 
-func executeBan(ip string) {
+func executeBan(ip string, score float64) {
 	if conf.PreviewMode {
-		log.Printf("👀 [PREVIEW] Would ban IP: %s (%d hits)", ip, conf.Threshold)
+		log.Printf("👀 [PREVIEW] Would ban IP: %s (score: %.1f)", ip, score)
 		banned[ip] = true // Mark as banned in memory for this session
 		return
 	}
@@ -323,7 +355,7 @@ func executeBan(ip string) {
 	log.Printf("🚫 BANNED: %s (set: %s)", ip, setName)
 }
 
-// scanFullLog reads the entire log file and processes all lines
+// scanFullLog reads the entire log file and processes all lines with weighted scoring
 func scanFullLog(path string) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -338,7 +370,8 @@ func scanFullLog(path string) {
 	totalLines := 0
 	parsedOK := 0
 	total4xx := 0
-	ipHits := make(map[string]int) // IP -> 4xx hit count
+	ipScores := make(map[string]float64)        // IP -> cumulative score
+	ipPaths := make(map[string]map[string]bool) // IP -> paths seen (for repeat penalty)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -349,17 +382,17 @@ func scanFullLog(path string) {
 			continue
 		}
 
-		var ip, status string
+		var ip, urlPath, status string
 		var matched bool
 
 		// Try override regex first
 		if reOverride != nil {
-			ip, status, matched = tryMatch(reOverride, line)
+			ip, urlPath, status, matched = tryMatchWithPath(reOverride, line)
 		}
 
 		// Try default log regex
 		if !matched {
-			ip, status, matched = tryMatch(reLog, line)
+			ip, urlPath, status, matched = tryMatchWithPath(reLog, line)
 		}
 
 		if !matched || !isValidIP(ip) {
@@ -368,24 +401,38 @@ func scanFullLog(path string) {
 
 		parsedOK++
 
-		// Count 4xx errors
+		// Count 4xx errors and calculate scores
 		if strings.HasPrefix(status, "4") {
 			total4xx++
-			ipHits[ip]++
+
+			// Initialize path tracking for this IP
+			if ipPaths[ip] == nil {
+				ipPaths[ip] = make(map[string]bool)
+			}
+
+			// Calculate score with repeat penalty
+			pathScore := calculateScore(urlPath)
+			if ipPaths[ip][urlPath] {
+				pathScore *= conf.RepeatPenalty
+			} else {
+				ipPaths[ip][urlPath] = true
+			}
+
+			ipScores[ip] += pathScore
 		}
 	}
 
 	// Collect IPs that exceed threshold
 	type ipStat struct {
-		ip   string
-		hits int
+		ip    string
+		score float64
 	}
 	var toBan []ipStat
 	uniqueIPs := 0
 
-	for ip, hits := range ipHits {
+	for ip, score := range ipScores {
 		uniqueIPs++
-		if hits >= conf.Threshold {
+		if score >= conf.BanThreshold {
 			// Skip whitelisted IPs
 			if whitelist[ip] {
 				continue
@@ -394,14 +441,14 @@ func scanFullLog(path string) {
 			if banned[ip] {
 				continue
 			}
-			toBan = append(toBan, ipStat{ip, hits})
+			toBan = append(toBan, ipStat{ip, score})
 		}
 	}
 
-	// Sort by hits descending
+	// Sort by score descending
 	for i := 0; i < len(toBan)-1; i++ {
 		for j := i + 1; j < len(toBan); j++ {
-			if toBan[j].hits > toBan[i].hits {
+			if toBan[j].score > toBan[i].score {
 				toBan[i], toBan[j] = toBan[j], toBan[i]
 			}
 		}
@@ -413,15 +460,15 @@ func scanFullLog(path string) {
 	fmt.Printf("   Parsed OK: %d\n", parsedOK)
 	fmt.Printf("   4xx errors: %d\n", total4xx)
 	fmt.Printf("   Unique IPs with 4xx: %d\n", uniqueIPs)
-	fmt.Printf("   IPs exceeding threshold (%d): %d\n", conf.Threshold, len(toBan))
+	fmt.Printf("   IPs exceeding threshold (%.1f): %d\n", conf.BanThreshold, len(toBan))
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	// Process IPs
 	for _, stat := range toBan {
 		if conf.PreviewMode {
-			fmt.Printf("👀 [PREVIEW] Would ban: %s (%d hits)\n", stat.ip, stat.hits)
+			fmt.Printf("👀 [PREVIEW] Would ban: %s (score: %.1f)\n", stat.ip, stat.score)
 		} else {
-			executeBan(stat.ip)
+			executeBan(stat.ip, stat.score)
 		}
 	}
 
@@ -438,6 +485,16 @@ func tryMatch(re *regexp.Regexp, line string) (string, string, bool) {
 		return "", "", false
 	}
 	return m[1], m[2], true
+}
+
+// tryMatchWithPath extracts IP, URL path, and status from log line
+// Returns: IP, urlPath, status, matched
+func tryMatchWithPath(re *regexp.Regexp, line string) (string, string, string, bool) {
+	m := re.FindStringSubmatch(line)
+	if len(m) < 4 {
+		return "", "", "", false
+	}
+	return m[1], m[2], m[3], true
 }
 
 func isValidIP(ipStr string) bool {
@@ -563,6 +620,74 @@ func getEnvBool(key string, fallback bool) bool {
 		return false
 	}
 	return fallback
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	s := getEnv(key, "")
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	return fallback
+}
+
+// loadRules parses the rules configuration file and populates the rules slice
+func loadRules(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Printf("⚠️  WARN: Cannot open rules file '%s': %v (using default scoring)", path, err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	loadedCount := 0
+
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse format: <score> <regex_pattern>
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			log.Printf("⚠️  WARN: Invalid rule format at line %d: %s", lineNum, line)
+			continue
+		}
+
+		score, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		if err != nil {
+			log.Printf("⚠️  WARN: Invalid score at line %d: %s", lineNum, parts[0])
+			continue
+		}
+
+		pattern := strings.TrimSpace(parts[1])
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			log.Printf("⚠️  WARN: Invalid regex at line %d: %s (%v)", lineNum, pattern, err)
+			continue
+		}
+
+		rules = append(rules, Rule{Score: score, Pattern: re, Raw: pattern})
+		loadedCount++
+	}
+
+	log.Printf("📋 Loaded %d threat detection rules from %s", loadedCount, path)
+}
+
+// calculateScore determines the score for a given URL path based on loaded rules
+func calculateScore(urlPath string) float64 {
+	for _, rule := range rules {
+		if rule.Pattern.MatchString(urlPath) {
+			return rule.Score
+		}
+	}
+	// Default score for unmatched paths
+	return 1.0
 }
 
 func main() {
