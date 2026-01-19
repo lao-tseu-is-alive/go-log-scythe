@@ -22,35 +22,86 @@ Unlike legacy tools or shell scripts, **LogScythe** uses  lookup tables, meaning
 
 ### 1. Prerequisites (nftables)
 
-LogScythe requires a modern Linux system with `nftables`. Ensure your `/etc/nftables.conf` is set up to handle the `parasites` set:
+LogScythe requires a modern Linux system with `nftables`. 
+
+Ensure your `/etc/nftables.conf` is set up to handle the `parasites` set:
+
+
+### ⚠️ ⚠️ You must edit your own version of `/etc/nftables.conf`  
+
+**this is VERY important if your are working on a remote server via SSH, ensure that your external IP is in the whitelist file before using this or you may ban yourself from accessing your remote server** 
+
+*the code of goLogScythe will try to detect your own ssh session IP and add it to your WHITELIST file, but you are responsible of your choices, and this should be configured and double checked by you !*
 
 ```nft
+#!/usr/sbin/nft -f
+
+flush ruleset
+
 table inet filter {
-    set parasites {
-        type ipv4_addr
+	# 1. Parasite Set for ipv4 (Used by  goLogScythe Tool)
+	set parasites {
+          type ipv4_addr
+          flags interval
+    }
+    # 1. Parasite Set for ipv6 (Used by  goLogScythe Tool)
+    set parasites6 {
+        type ipv6_addr
         flags interval
     }
+	chain input {
+		type filter hook input priority 0; policy drop;
+		# 2. Early Drop: Block parasites before anything else
+	        ip saddr @parasites drop
+	        ip6 saddr @parasites6 drop
 
-    chain input {
-        type filter hook input priority 0; policy accept;
-        
-        # Block parasites at the very front
-        ip saddr @parasites drop
-    }
+        	# 3. Allow Loopback (essential)
+	        iif "lo" accept
+
+		# 4. Allow essential IPv4 + IPv6 ICMP (after loopback, before established)
+		ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
+		icmpv6 type { echo-request, echo-reply, packet-too-big, destination-unreachable, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
+
+        	# 5. Allow Established (Already connected traffic)
+	        ct state established,related accept
+
+        	# 6. ⚠️⚠️ Double check to add your own rules here !
+	        tcp dport 22 ip saddr 192.168.50.7 accept comment "YOUR BASTION IP SSH"
+
+        	tcp dport { 80, 443 } accept comment "for Nginx HTTP/S"
+
+	}
+	chain forward {
+		type filter hook forward priority filter;
+	}
+	chain output {
+		type filter hook output priority filter;
+	}
 }
+
 
 ```
 
-*Apply with: `sudo nft -f /etc/nftables.conf*`
+*Check syntax and apply with:*
+
+    sudo nft --check -f /etc/nftables.conf
+    sudo nft -f /etc/nftables.conf
+
+    
 
 ### 2. Installation
 
+##### Option 1. Installation from source if you have Go installed
 ```bash
-git clone https://github.com/your-username/logscythe.git
-cd logscythe
-go build -o logscythe main.go
+git clone https://github.com/lao-tseu-is-alive/go-log-scythe.git
+cd go-log-scythe
+go build -o goLogScythe main.go
 
 ```
+##### Option 2. Installation from the releases pages
+
+Navigate to  https://github.com/lao-tseu-is-alive/go-log-scythe/releases
+and download the latest version for your Linux architecture.
 
 ### 3. Configuration
 
@@ -87,16 +138,18 @@ sudo PREVIEW_MODE=true ./logscythe
 
 ## ⚙️ Environment Variables
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `LOG_PATH` | `/var/log/nginx/access.log` | Path to the web log file to monitor. |
-| `WHITE_LIST_PATH` | `./whitelist.txt` | File containing IPs/CIDRs that should never be banned. |
-| `BANNED_FILE_PATH` | `./banned_ips.txt` | Persistence file for banned IPs. |
-| `BAN_THRESHOLD` | `10` | Number of 4xx hits before a ban is issued. |
-| `BAN_WINDOW` | `15m` | Sliding window duration for error counting. |
-| `NFT_SET_NAME` | `parasites` | The name of the nftables set to target. |
-| `REGEX_OVERRIDE` | `""` | Custom regex to use for log parsing. |
-| `PREVIEW_MODE` | `false` | If true, logs actions but skips firewall commands. |
+| Variable | Default | Description                                                    |
+| --- | --- |----------------------------------------------------------------|
+| `LOG_PATH` | `/var/log/nginx/access.log` | Path to the web log file to monitor.                           |
+| `WHITE_LIST_PATH` | `./whitelist.txt` | File containing IPs/CIDRs that should never be banned.         |
+| `BANNED_FILE_PATH` | `./banned_ips.txt` | Persistence file for banned IPs.                               |
+| `BAN_THRESHOLD` | `10` | Number of 4xx hits before a ban is issued.                     |
+| `BAN_WINDOW` | `15m` | Sliding window duration for error counting.                    |
+| `NFT_SET_NAME` | `parasites` | The name of the nftables set to target.                        |
+| `REGEX_OVERRIDE` | `""` | Custom regex to use for log parsing.                           |
+| `PREVIEW_MODE` | `false` | If true, logs actions but skips firewall commands.             |
+| `SCAN_ALL_MODE` | `false` | If true, will parse all the log file to look for malicious ip. |
+
 
 ---
 

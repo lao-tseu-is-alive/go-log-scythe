@@ -29,7 +29,7 @@ import (
 const (
 	APP                  = "goLogScythe"
 	AppSnake             = "go-log-scythe"
-	VERSION              = "0.1.0"
+	VERSION              = "0.1.1"
 	REPOSITORY           = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath       = "/var/log/nginx/access.log"
 	defaultWhitelistPath = "./whitelist.txt"
@@ -566,7 +566,7 @@ func getEnvBool(key string, fallback bool) bool {
 }
 
 func main() {
-	fmt.Printf("🚀 🛡️ Starting App:'%s', ver:%s, BuildStamp: %s, Repo: %s\n", APP, VERSION, REPOSITORY)
+	fmt.Printf("🚀 🛡️ Starting App:'%s', ver:%s, Repo: %s\n", APP, VERSION, REPOSITORY)
 
 	if conf.PreviewMode {
 		fmt.Println("🔍 PREVIEW MODE: No real bans will be issued.")
