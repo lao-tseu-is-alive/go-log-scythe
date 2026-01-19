@@ -27,6 +27,10 @@ import (
 
 // --- Default Constants ---
 const (
+	APP                  = "goLogScythe"
+	AppSnake             = "go-log-scythe"
+	VERSION              = "0.1.0"
+	REPOSITORY           = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath       = "/var/log/nginx/access.log"
 	defaultWhitelistPath = "./whitelist.txt"
 	defaultBannedPath    = "./banned_ips.txt"
@@ -184,49 +188,6 @@ func init() {
 	visitorCache = NewLRUCache(maxVisitors)
 }
 
-func main() {
-	fmt.Println("🛡️  LogScythe: Starting Native Log Monitor")
-	if conf.PreviewMode {
-		fmt.Println("🔍 PREVIEW MODE: No real bans will be issued.")
-	}
-	if conf.ScanAllMode {
-		fmt.Println("📊 SCAN ALL MODE: Reading entire log file...")
-	}
-
-	// Setup graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigChan
-		log.Printf("\n🛑 Received %v, shutting down gracefully...", sig)
-		cancel()
-	}()
-
-	// 1. Safety Phase
-	loadSafetyWhitelist()
-
-	// 2. Sync Phase (Skip kernel sync if in preview)
-	if !conf.PreviewMode {
-		loadAndSyncBannedList()
-	}
-
-	// 3. Scan All Mode - process entire log file first
-	if conf.ScanAllMode {
-		scanFullLog(conf.LogPath)
-		return // Exit after scan in this mode
-	}
-
-	// 4. Maintenance Phase (only for tail mode)
-	go janitor(ctx)
-
-	// 5. Execution Phase
-	tailLog(ctx, conf.LogPath)
-
-	log.Println("✅ LogScythe stopped.")
-}
-
 func tailLog(ctx context.Context, path string) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -296,9 +257,7 @@ func processLine(line string) {
 
 	if !matched || !isValidIP(ip) {
 		// Log a warning for data we can't parse, but keep the program running
-		if line != "" {
-			log.Printf("⚠️  WARN: Skipping unparseable line: %s", strings.TrimSpace(line))
-		}
+		log.Printf("⚠️  WARN: Skipping unparseable line: %s", strings.TrimSpace(line))
 		return
 	}
 
@@ -604,4 +563,48 @@ func getEnvBool(key string, fallback bool) bool {
 		return false
 	}
 	return fallback
+}
+
+func main() {
+	fmt.Printf("🚀 🛡️ Starting App:'%s', ver:%s, BuildStamp: %s, Repo: %s\n", APP, VERSION, REPOSITORY)
+
+	if conf.PreviewMode {
+		fmt.Println("🔍 PREVIEW MODE: No real bans will be issued.")
+	}
+	if conf.ScanAllMode {
+		fmt.Println("📊 SCAN ALL MODE: Reading entire log file...")
+	}
+
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("\n🛑 Received %v, shutting down gracefully...", sig)
+		cancel()
+	}()
+
+	// 1. Safety Phase
+	loadSafetyWhitelist()
+
+	// 2. Sync Phase (Skip kernel sync if in preview)
+	if !conf.PreviewMode {
+		loadAndSyncBannedList()
+	}
+
+	// 3. Scan All Mode - process entire log file first
+	if conf.ScanAllMode {
+		scanFullLog(conf.LogPath)
+		return // Exit after scan in this mode
+	}
+
+	// 4. Maintenance Phase (only for tail mode)
+	go janitor(ctx)
+
+	// 5. Execution Phase
+	tailLog(ctx, conf.LogPath)
+
+	log.Println("✅ LogScythe stopped.")
 }

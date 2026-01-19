@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    # Publish semver tags as releases.
+    tags: [ 'v[0-9]+.[0-9]+.[0-9]+' ]
+
+
+permissions:
+  contents: write # Grant write access to repository contents
+  actions: read # Grant read access to repository actions
+  discussions: read # Grant read access to repository discussions
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest # Use ubuntu-latest to build, as it supports cross-compilation
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4 # Action to checkout your repository code
+      - name: Set env
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+      - name: Preparing Test Env
+        run: |
+          echo $RELEASE_VERSION
+          echo ${{ env.RELEASE_VERSION }}   
+      - name: Setup Go
+        uses: actions/setup-go@v5 # Action to set up the Go environment
+        with:
+          go-version: '1.25.5' # Specify the Go version you want to use
+      - run: go version
+
+      - name: Build
+        run: |
+          # Set environment variables for cross-compilation
+          # GOOS: target operating system
+          # GOARCH: target architecture
+          # CGO_ENABLED=0: Disable CGO for static linking (recommended for portability)
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o goLogScythe-linux-amd64 ./cmd/goLogScythe/goLogScythe.go 
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o goLogScythe-linux-arm64 ./cmd/goLogScythe/goLogScythe.go
+
+      - name: Create Archives
+        run: |
+          tar -czvf goLogScythe-linux-amd64.tar.gz goLogScythe-linux-amd64
+          tar -czvf goLogScythe-linux-arm64.tar.gz goLogScythe-linux-arm64
+
+      - name: Calculate Sha256 hash
+        run: |
+          sha256sum goLogScythe-* > SHA256.txt
+
+      - name: Upload Release Asset for Linux/macOS
+        uses: softprops/action-gh-release@v2.2.2
+        with:
+          body:  Release${{ env.RELEASE_VERSION }}
+          files: |
+            goLogScythe-linux-amd64.tar.gz
+            goLogScythe-linux-arm64.tar.gz
+            SHA256.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Automatically provided by GitHub Actions
