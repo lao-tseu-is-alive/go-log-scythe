@@ -27,25 +27,28 @@ import (
 
 // --- Default Constants ---
 const (
-	APP                  = "goLogScythe"
-	AppSnake             = "go-log-scythe"
-	VERSION              = "0.2.0"
-	REPOSITORY           = "https://github.com/lao-tseu-is-alive/go-log-scythe"
-	defaultLogPath       = "/var/log/nginx/access.log"
-	defaultWhitelistPath = "./whitelist.txt"
-	defaultBannedPath    = "./banned_ips.txt"
-	defaultRulesPath     = ""   // Empty means no rules file (backward compatible)
-	defaultThreshold     = 10.0 // Score threshold for banning
-	defaultRepeatPenalty = 0.1  // 10% of full score for repeat path hits
-	defaultWindow        = 15 * time.Minute
-	defaultNftSet        = "parasites"
-	defaultNftSetV6      = "parasites6"
-	maxVisitors          = 10000 // Maximum visitors to track before eviction
-
+	APP                          = "goLogScythe"
+	AppSnake                     = "go-log-scythe"
+	VERSION                      = "0.2.1"
+	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
+	defaultLogPath               = "/var/log/nginx/access.log"
+	defaultWhitelistPath         = "./whitelist.txt"
+	defaultBannedPath            = "./banned_ips.txt"
+	defaultRulesPath             = ""   // Empty means no rules file (backward compatible)
+	defaultThreshold             = 10.0 // Score threshold for banning
+	defaultRepeatPenalty         = 0.1  // 10% of full score for repeat path hits
+	defaultWindow                = 15 * time.Minute
+	defaultNftSet                = "parasites"
+	defaultNftSetV6              = "parasites6"
+	maxVisitors                  = 10000 // Maximum visitors to track before eviction
+	VerySuspiciousBinProbesScore = 12.666
 	// Combined Log Format Regex (works for both Nginx and Apache)
-	// Matches: 1.2.3.4 - - [Date] "METHOD /path HTTP/x.x" 404 ...
-	// Group 1: IP, Group 2: URL path, Group 3: Status code
-	defaultLogRegex = `^(\S+)\s+-\s+-\s+\[.*?\]\s+"\S+\s+(\S+)\s+.*?"\s+(\d{3})`
+	// Uses (?s) to handle binary garbage/newlines in malformed requests
+	// Matches: 1.2.3.4 - - [Date] \"METHOD /path HTTP/x.x\" 404 ...
+	// OR malformed: 1.2.3.4 - - [Date] \"<binary garbage>\" 400 ...
+	// Group 1: IP, Group 2: URL path (may be empty for malformed), Group 3: Status code
+	// Two-stage: try to extract path, fallback to just IP/status for binary probes
+	defaultLogRegex = `(?s)^(\S+)\s+-\s+-\s+\[.*?\]\s+"(?:\S+\s+(\S*)\s+.*?|.*?)"\s+(\d{3})`
 )
 
 // Rule represents a threat detection rule with a score and regex pattern
@@ -296,6 +299,9 @@ func processLine(line string) {
 
 	// Calculate score for this path
 	pathScore := calculateScore(urlPath)
+	if pathScore == VerySuspiciousBinProbesScore {
+		log.Printf("⚠️ %s made a very suspicious ip request in log line: %s", ip, strings.TrimSpace(line))
+	}
 
 	// Use LRU cache for visitor tracking (auto-evicts oldest when full)
 	v, exists := visitorCache.Get(ip)
@@ -412,6 +418,9 @@ func scanFullLog(path string) {
 
 			// Calculate score with repeat penalty
 			pathScore := calculateScore(urlPath)
+			if pathScore == VerySuspiciousBinProbesScore {
+				log.Printf("⚠️ %s made a very suspicious ip request in log line: %s", ip, strings.TrimSpace(line))
+			}
 			if ipPaths[ip][urlPath] {
 				pathScore *= conf.RepeatPenalty
 			} else {
@@ -681,6 +690,12 @@ func loadRules(path string) {
 
 // calculateScore determines the score for a given URL path based on loaded rules
 func calculateScore(urlPath string) float64 {
+	// Binary probes: empty path means malformed/garbage request (RDP, TLS, SMB probes)
+	// These are extremely malicious - instant ban worthy
+	if urlPath == "" {
+		return VerySuspiciousBinProbesScore // Critical: binary protocol probe detected
+	}
+
 	for _, rule := range rules {
 		if rule.Pattern.MatchString(urlPath) {
 			return rule.Score
