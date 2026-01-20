@@ -1,6 +1,10 @@
 # 🛡️ GoLogScythe
 
-**GoLogScythe** is a high-performance, zero-dependency security daemon written in Go. It harvests malicious IP addresses from your web server logs (Nginx/Apache) and banishes them to the kernel-level void using `nftables` Sets.
+**GoLogScythe** is a high-performance, zero-dependency intelligent real-time web log
+security daemon written in Go. 
+It harvests malicious IP addresses from your web server logs (Nginx/Apache) 
+and banishes them to the kernel-level void using `nftables` Sets. 
+It uses a configurable weighted threat scoring and binary probe detection.
 
 Unlike legacy tools or shell scripts, **LogScythe** uses lookup tables, meaning it can ban 100,000 parasites with the same near-zero CPU impact as banning just one.
 
@@ -20,6 +24,7 @@ Unlike legacy tools or shell scripts, **LogScythe** uses lookup tables, meaning 
 * **Environment Driven:** Fully configurable via `.env` or system environment variables.
 
 ---
+![](https://raw.githubusercontent.com/lao-tseu-is-alive/go-log-scythe/refs/heads/main/images/goLogScythe.jpg)
 
 ## 🎯 Weighted Scoring System (v0.2.0+)
 
