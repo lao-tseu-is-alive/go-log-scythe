@@ -1,22 +1,19 @@
 #!/bin/bash
-# find_missed_ip_parasites.sh (Fixed Version)
+# find_missed_ip_parasites.sh
 
-# 1. Match your daemon's threshold
-THRESHOLD=5 
+THRESHOLD=5
 BANNED_FILE="/var/lib/go-log-scythe/banned_ips.txt"
-
-echo "--------------------------------------------------------"
-echo "🔍 Identifying IPs with hits >= $THRESHOLD that are NOT BANNED"
-echo "--------------------------------------------------------"
-
-# 2. Get high-count IPs from your existing script logic
-# We scan all access logs exactly once
 LOG_FILES="/var/log/nginx/*access.log"
 
-# Create a temporary summary of IPs and their real counts
-TEMP_STATS=$(gawk '$9 > 399 {print $1}' $LOG_FILES | sort | uniq -c)
+echo "--------------------------------------------------------"
+echo "🔍 Identifying IPs with hits >= $THRESHOLD (Status > 399) not in Firewall"
+echo "--------------------------------------------------------"
 
-# Extract only those meeting the threshold
+# 1. Get stats: Status > 399 -> Unique (IP, URL) -> Count per IP
+# We use 'sort -u' to ensure we only count an IP once for each specific URL it attacked
+TEMP_STATS=$(gawk '$9 > 399 {print $1, $7}' $LOG_FILES | sort -u | awk '{print $1}' | sort | uniq -c)
+
+# 2. Extract IPs that meet the threshold
 IPS_TO_CHECK=$(echo "$TEMP_STATS" | gawk -v t=$THRESHOLD '$1 >= t {print $2}')
 
 # 3. Get active nftables rules
@@ -41,6 +38,6 @@ for ip in $IPS_TO_CHECK; do
     if [ "$IS_BANNED" = false ]; then
         # Extract the real count from our TEMP_STATS
         COUNT=$(echo "$TEMP_STATS" | grep " $ip$" | awk '{print $1}')
-        echo "🚩 MISSING: $ip ($COUNT real hits) is NOT in firewall sets!"
+        echo "🚩 MISSING: $ip ($COUNT unique probe paths) is NOT in firewall!"
     fi
 done
