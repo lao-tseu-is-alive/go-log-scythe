@@ -1,0 +1,27 @@
+[Unit]
+Description=GoLogScythe - High-performance Log Security Daemon
+After=network.target nftables.service
+Documentation=https://github.com/lao-tseu-is-alive/go-log-scythe
+
+[Service]
+Type=simple
+# The binary needs root to execute 'nft' commands
+User=root
+Group=root
+
+WorkingDirectory=/var/lib/go-log-scythe
+ExecStart=/usr/local/bin/goLogScythe-linux-amd64
+Restart=always
+RestartSec=5
+
+# Load configuration
+EnvironmentFile=/etc/go-log-scythe/config.env
+
+# Hardening attributes
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/var/log/nginx/
+
+[Install]
+WantedBy=multi-user.target
