@@ -7,7 +7,7 @@ mkdir /etc/go-log-scythe/
 rsync -av config.env /etc/go-log-scythe/
 rsync -av go-log-scythe.service /etc/systemd/system/go-log-scythe.service
 rsync -av nftables.conf /etc/
-rsync -av go-log-scythe
+rsync -av go-log-scythe /var/lib/
 ufw status
 crontab -l
 ufw status > "ufw_status_${TODAY}.txt"
