@@ -10,7 +10,6 @@ deployments/*
 documentation/
 .git
 .github
-deploy/
 images/
 samples/
 scripts/
