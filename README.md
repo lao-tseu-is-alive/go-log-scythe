@@ -1,5 +1,8 @@
 # 🛡️ GoLogScythe
 
+[![cve-trivy-scan](https://github.com/lao-tseu-is-alive/go-log-scythe/actions/workflows/cve-trivy-scan.yml/badge.svg)](https://github.com/lao-tseu-is-alive/go-log-scythe/actions/workflows/cve-trivy-scan.yml)
+
+
 **GoLogScythe** is a high-performance, zero-dependency intelligent real-time web log
 security daemon written in Go. 
 It harvests malicious IP addresses from your web server logs (Nginx/Apache) 
