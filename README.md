@@ -14,8 +14,10 @@ Unlike legacy tools or shell scripts, **LogScythe** uses lookup tables, meaning 
 
 * **Zero Dependencies:** Pure Go standard library. No `tail` libraries, no bloat.
 * **High Performance:** Leverages `nftables` Sets for constant-time packet filtering.
-* **Weighted Scoring System:** Assign different threat levels to different URL patterns via `rules.conf`.
+* **Thread-Safe:** LRU cache uses internal `RWMutex` — safe under concurrent access.
+* **Weighted Scoring System:** Assign different threat levels to different URL patterns via `rules.conf`, with per-hit score clamping for safety.
 * **Binary Probe Detection:** Automatically detects and instantly bans RDP, TLS, SMB protocol probes sent to web ports.
+* **IPv6 Normalization:** Canonical IP representation prevents duplicate tracking of the same address.
 * **Repeat Penalty:** Reduces score for repeated requests to the same path (attackers hammering one URL).
 * **Safety First:** Automatic whitelisting of your current SSH session, localhost, and existing UFW rules.
 * **Dual-Regex Fallback:** Intelligent parsing logic that supports Nginx and Apache formats out of the box.
@@ -23,6 +25,8 @@ Unlike legacy tools or shell scripts, **LogScythe** uses lookup tables, meaning 
 * **Persistence:** Bans survive reboots via a local state file and automatic kernel re-synchronization.
 * **Preview Mode:** Test your configuration against live logs without actually triggering firewall actions.
 * **Environment Driven:** Fully configurable via `.env` or system environment variables.
+
+> See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ---
 ![](https://raw.githubusercontent.com/lao-tseu-is-alive/go-log-scythe/refs/heads/main/images/goLogScythe.jpg)
@@ -68,7 +72,8 @@ Internet → CDN/DDoS Shield → Reverse Proxy (Nginx) → GoLogScythe → nftab
 
 ## 🎯 Weighted Scoring System (v0.2.0+)
 
-GoLogScythe uses an intelligent weighted scoring system instead of simple request counting:
+GoLogScythe uses an intelligent weighted scoring system instead of simple request counting.
+All scores are **clamped to a maximum of 20.0 per hit** (v0.3.0+) to prevent misconfigured rules from causing instant bans:
 
 | Threat Level | Score | Examples |
 |--------------|-------|----------|
@@ -77,6 +82,7 @@ GoLogScythe uses an intelligent weighted scoring system instead of simple reques
 | **High** | 5.0 | .env, wp-config.php, .git/, phpinfo.php |
 | **Critical** | 10.0 | Directory traversal, SQL injection, shell uploads |
 | **Binary Probe** | 12.666 | RDP/TLS/SMB probes (empty HTTP method) |
+| **Max per hit** | 20.0 | Clamped ceiling — no single hit exceeds this |
 
 ### Externalized Rules (`rules.conf`)
 
@@ -320,8 +326,9 @@ sudo PREVIEW_MODE=true SCAN_ALL_MODE=true ./goLogScythe
 | `BAN_WINDOW` | `15m` | Sliding window duration for score tracking |
 | `NFT_SET_NAME` | `parasites` | The name of the nftables set for IPv4 |
 | `NFT_SET_NAME_V6` | `parasites6` | The name of the nftables set for IPv6 |
+| `CACHE_CAPACITY` | `10000` | Maximum number of visitor IPs tracked simultaneously (v0.3.0+) |
 | `REGEX_OVERRIDE` | `""` | Custom regex for log parsing (see [Custom Log Formats](#-custom-log-formats-regex_override)) |
-| `PREVIEW_MODE` | `false` | If true, logs actions but skips firewall commands |
+| `PREVIEW_MODE` | `false` | If true, logs actions but skips firewall commands (clears banned map on start) |
 | `SCAN_ALL_MODE` | `false` | If true, scans the entire log file at startup |
 
 ---

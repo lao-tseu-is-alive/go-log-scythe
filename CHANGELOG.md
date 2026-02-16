@@ -1,0 +1,72 @@
+# Changelog
+
+All notable changes to **GoLogScythe** will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [0.3.0] - 2026-02-16
+
+### Added
+- **Thread-safe LRU cache** — internal `sync.RWMutex` in `LRUCache` for correct concurrent access; the cache no longer relies on an external global lock.
+- **IPv6 normalization** — new `normalizeIP()` function ensures equivalent IPv6 representations (e.g., `::1` and `0:0:0:0:0:0:0:1`) map to the same visitor/banned key.
+- **Score clamping** — `maxScorePerHit` constant (20.0) prevents any single rule hit from exceeding a safe maximum, guarding against misconfigured `rules.conf`.
+- **Pattern length validation** — `loadRules()` rejects regex patterns longer than 512 characters and warns when rule scores exceed the per-hit cap.
+- **Preview mode cleanup** — the `banned` map is now cleared on startup when `PREVIEW_MODE=true`, so preview sessions always start with fresh threat tracking.
+- **Configurable cache capacity** — new `CACHE_CAPACITY` environment variable (default: 10000) replaces the hardcoded limit.
+- **8 new tests** covering concurrency (`TestLRUCacheConcurrency`, `TestProcessLineConcurrency`), IP normalization, score clamping, pattern length validation, and cache capacity.
+
+### Changed
+- Janitor goroutine no longer acquires the global mutex — it uses the cache's internal lock instead.
+- Global `mu` mutex scope clarified: it now only protects the `banned` and `whitelist` maps.
+
+### Fixed
+- Potential race condition when janitor and `processLine` access the LRU cache concurrently (cache now self-synchronizes).
+- IPv6 addresses in different textual forms could create duplicate visitor entries; now normalized on ingestion.
+- Preview mode could accumulate stale banned IPs from a previous session's persisted file.
+
+---
+
+## [0.2.1] - 2026-01-20
+
+### Added
+- **Binary probe detection** — automatically detects and bans RDP, TLS, and SMB protocol probes sent to web ports (empty HTTP method → score 12.666).
+- Tolerant regex using `(?s)` flag to handle binary garbage and newlines in malformed requests.
+- `tryMatchWithPath()` function extracting IP, URL path, and status in a single pass.
+
+### Changed
+- Default log regex updated to a 3-group pattern (IP, path, status) supporting both normal and malformed requests.
+- `processLine()` and `scanFullLog()` now use `tryMatchWithPath()` for unified parsing.
+
+---
+
+## [0.2.0] - 2026-01-19
+
+### Added
+- **Weighted scoring system** — configurable threat scores instead of simple request counting.
+- **Externalized rules** — `rules.conf` file for defining URL pattern → score mappings.
+- **Repeat penalty** — `REPEAT_PENALTY` (default 0.1) reduces score for repeated hits to the same path.
+- **LRU eviction** — bounded visitor cache (`maxVisitors` = 10000) with LRU eviction policy.
+- **Scan all mode** — `SCAN_ALL_MODE=true` reads the entire log file and reports findings.
+- `RULES_PATH`, `BAN_THRESHOLD`, `REPEAT_PENALTY` environment variables.
+
+### Changed
+- Scoring model replaced simple hit counting with cumulative weighted scores.
+- Default ban threshold changed from a count to a score-based threshold (10.0).
+
+---
+
+## [0.1.0] - 2026-01-16
+
+### Added
+- Initial release.
+- Real-time log monitoring via `tailLog()` with truncation-based log rotation detection.
+- IPv4 and IPv6 support with automatic `nftables` set selection (`parasites` / `parasites6`).
+- Safety whitelisting of localhost, SSH session IP, UFW rules, and custom whitelist file.
+- Persistence of banned IPs to file with kernel re-sync on startup.
+- Preview mode (`PREVIEW_MODE=true`) for dry-run testing.
+- Environment-driven configuration via `.env` file or system variables.
+- Dual-regex fallback with `REGEX_OVERRIDE` for custom log formats.
+- Comprehensive unit tests.

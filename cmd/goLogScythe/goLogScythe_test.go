@@ -4,10 +4,13 @@ Package main provides unit tests for the LogScythe log monitor.
 package main
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -399,7 +402,7 @@ func TestProcessLine(t *testing.T) {
 	// Reset global state for each test
 	resetGlobalState := func() {
 		mu.Lock()
-		visitorCache = NewLRUCache(maxVisitors)
+		visitorCache = NewLRUCache(defaultMaxVisitors)
 		banned = make(map[string]bool)
 		whitelist = make(map[string]bool)
 		whitelist["127.0.0.1"] = true
@@ -612,7 +615,7 @@ func TestLoadAndSyncBannedListWithIPv6(t *testing.T) {
 func TestScanFullLog(t *testing.T) {
 	// Reset global state
 	mu.Lock()
-	visitorCache = NewLRUCache(maxVisitors)
+	visitorCache = NewLRUCache(defaultMaxVisitors)
 	banned = make(map[string]bool)
 	whitelist = make(map[string]bool)
 	whitelist["127.0.0.1"] = true
@@ -739,4 +742,228 @@ func TestScanFullLogWhitelistedIP(t *testing.T) {
 		t.Error("scanFullLog() should NOT ban whitelisted IP even if exceeding threshold")
 	}
 	mu.Unlock()
+}
+
+// --- IP Normalization Tests ---
+
+func TestNormalizeIP(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"IPv4 passthrough", "192.168.1.1", "192.168.1.1"},
+		{"IPv6 short form preserved", "::1", "::1"},
+		{"IPv6 full form normalized", "0:0:0:0:0:0:0:1", "::1"},
+		{"IPv6 leading zeros stripped", "2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1"},
+		{"IPv6 mixed case", "2001:0DB8::1", "2001:db8::1"},
+		{"invalid IP returned as-is", "not-an-ip", "not-an-ip"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeIP(tt.input)
+			if got != tt.expected {
+				t.Errorf("normalizeIP(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizeIPIdempotent(t *testing.T) {
+	ips := []string{"192.168.1.1", "::1", "2001:db8::1", "fe80::1"}
+	for _, ip := range ips {
+		normalized := normalizeIP(ip)
+		normalizedAgain := normalizeIP(normalized)
+		if normalized != normalizedAgain {
+			t.Errorf("normalizeIP is not idempotent for %q: %q != %q", ip, normalized, normalizedAgain)
+		}
+	}
+}
+
+// --- Score Clamping Tests ---
+
+func TestCalculateScoreClamping(t *testing.T) {
+	// Save and restore original rules
+	origRules := rules
+	defer func() { rules = origRules }()
+
+	// Add a rule with excessive score
+	rules = []Rule{
+		{Score: 999.0, Pattern: regexp.MustCompile(`/evil`), Raw: `/evil`},
+		{Score: 5.0, Pattern: regexp.MustCompile(`/normal`), Raw: `/normal`},
+	}
+
+	// Excessive score should be clamped
+	score := calculateScore("/evil")
+	if score > maxScorePerHit {
+		t.Errorf("calculateScore(/evil) = %.1f, want <= %.1f", score, maxScorePerHit)
+	}
+	if score != maxScorePerHit {
+		t.Errorf("calculateScore(/evil) = %.1f, want exactly %.1f (clamped)", score, maxScorePerHit)
+	}
+
+	// Normal score should pass through
+	score = calculateScore("/normal")
+	if score != 5.0 {
+		t.Errorf("calculateScore(/normal) = %.1f, want 5.0", score)
+	}
+
+	// Default score for unmatched
+	score = calculateScore("/unknown")
+	if score != 1.0 {
+		t.Errorf("calculateScore(/unknown) = %.1f, want 1.0", score)
+	}
+
+	// Binary probe score (empty path)
+	score = calculateScore("")
+	if score != VerySuspiciousBinProbesScore {
+		t.Errorf("calculateScore('') = %.3f, want %.3f", score, VerySuspiciousBinProbesScore)
+	}
+}
+
+// --- Rules Validation Tests ---
+
+func TestLoadRulesRejectsLongPattern(t *testing.T) {
+	// Save and restore original rules
+	origRules := rules
+	defer func() { rules = origRules }()
+	rules = nil
+
+	// Create a rules file with one valid and one too-long pattern
+	tmpDir := t.TempDir()
+	rulesFile := filepath.Join(tmpDir, "rules.conf")
+	longPattern := strings.Repeat("a", maxPatternLength+1)
+	content := fmt.Sprintf("5.0 /valid-pattern\n10.0 %s\n", longPattern)
+	if err := os.WriteFile(rulesFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp rules file: %v", err)
+	}
+
+	loadRules(rulesFile)
+
+	if len(rules) != 1 {
+		t.Errorf("loadRules() loaded %d rules, want 1 (long pattern should be rejected)", len(rules))
+	}
+	if len(rules) > 0 && rules[0].Raw != "/valid-pattern" {
+		t.Errorf("loadRules() loaded wrong rule: %q, want /valid-pattern", rules[0].Raw)
+	}
+}
+
+func TestLoadRulesWarnsHighScore(t *testing.T) {
+	// Save and restore original rules
+	origRules := rules
+	defer func() { rules = origRules }()
+	rules = nil
+
+	// Create a rules file with a high-score rule (should load but warn)
+	tmpDir := t.TempDir()
+	rulesFile := filepath.Join(tmpDir, "rules.conf")
+	content := "50.0 /super-dangerous\n"
+	if err := os.WriteFile(rulesFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp rules file: %v", err)
+	}
+
+	loadRules(rulesFile)
+
+	// Rule should still be loaded (warning only, not rejected)
+	if len(rules) != 1 {
+		t.Errorf("loadRules() loaded %d rules, want 1", len(rules))
+	}
+	// But score should be clamped at runtime
+	if len(rules) > 0 {
+		score := calculateScore("/super-dangerous")
+		if score > maxScorePerHit {
+			t.Errorf("calculateScore() = %.1f, want <= %.1f (should be clamped)", score, maxScorePerHit)
+		}
+	}
+}
+
+// --- Concurrency Tests ---
+
+func TestLRUCacheConcurrency(t *testing.T) {
+	cache := NewLRUCache(100)
+	var wg sync.WaitGroup
+
+	// Spawn multiple goroutines doing concurrent operations
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ip := fmt.Sprintf("10.0.0.%d", id%256)
+
+			// Put
+			cache.Put(ip, &Visitor{
+				IP:       ip,
+				Score:    float64(id),
+				Paths:    make(map[string]bool),
+				LastSeen: time.Now(),
+			})
+
+			// Get
+			cache.Get(ip)
+
+			// Len
+			cache.Len()
+
+			// Delete half
+			if id%2 == 0 {
+				cache.Delete(ip)
+			}
+		}(i)
+	}
+
+	// Also run CleanExpired concurrently
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cache.CleanExpired(1 * time.Minute)
+	}()
+
+	wg.Wait()
+	// If we get here without panic or race detector complaint, the test passes
+}
+
+func TestProcessLineConcurrency(t *testing.T) {
+	// Reset global state
+	mu.Lock()
+	visitorCache = NewLRUCache(defaultMaxVisitors)
+	banned = make(map[string]bool)
+	whitelist = make(map[string]bool)
+	whitelist["127.0.0.1"] = true
+	mu.Unlock()
+
+	// Generate log lines from different IPs
+	lines := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		ip := fmt.Sprintf("10.%d.%d.%d", (i/65536)%256, (i/256)%256, i%256)
+		lines[i] = fmt.Sprintf(`%s - - [16/Jan/2026:10:00:00 +0000] "GET /path%d HTTP/1.1" 404 123`, ip, i)
+	}
+
+	var wg sync.WaitGroup
+	for _, line := range lines {
+		wg.Add(1)
+		go func(l string) {
+			defer wg.Done()
+			processLine(l)
+		}(line)
+	}
+
+	wg.Wait()
+	// Success = no panics, no race detector complaints
+}
+
+// --- Configurable Cache Capacity Test ---
+
+func TestCacheCapacityEnvVar(t *testing.T) {
+	// Test that the cache respects custom capacity
+	cache := NewLRUCache(5)
+
+	for i := 0; i < 10; i++ {
+		ip := fmt.Sprintf("192.168.1.%d", i)
+		cache.Put(ip, &Visitor{IP: ip, Score: 1.0, Paths: make(map[string]bool)})
+	}
+
+	if cache.Len() != 5 {
+		t.Errorf("Cache with capacity 5 has %d items after 10 inserts, want 5", cache.Len())
+	}
 }

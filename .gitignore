@@ -37,3 +37,5 @@ go.work.sum
 banned_ip/
 vdl_install
 /evidences/
+/goLogScythe
+/docker-testing.md

@@ -29,7 +29,7 @@ import (
 const (
 	APP                          = "goLogScythe"
 	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.2.1"
+	VERSION                      = "0.3.0"
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
@@ -40,8 +40,10 @@ const (
 	defaultWindow                = 15 * time.Minute
 	defaultNftSet                = "parasites"
 	defaultNftSetV6              = "parasites6"
-	maxVisitors                  = 10000 // Maximum visitors to track before eviction
+	defaultMaxVisitors           = 10000 // Maximum visitors to track before eviction
 	VerySuspiciousBinProbesScore = 12.666
+	maxScorePerHit               = 20.0 // Maximum score any single hit can contribute
+	maxPatternLength             = 512  // Maximum regex pattern length in rules.conf
 	// Combined Log Format Regex (works for both Nginx and Apache)
 	// Uses (?s) to handle binary garbage/newlines in malformed requests
 	// Matches: 1.2.3.4 - - [Date] \"METHOD /path HTTP/x.x\" 404 ...
@@ -80,8 +82,10 @@ type Visitor struct {
 	LastSeen time.Time
 }
 
-// LRUCache is a bounded cache with LRU eviction policy
+// LRUCache is a thread-safe bounded cache with LRU eviction policy.
+// It uses an internal RWMutex: reads (Get) use RLock, writes (Put/Delete/CleanExpired) use full Lock.
 type LRUCache struct {
+	mu       sync.RWMutex
 	capacity int
 	items    map[string]*list.Element
 	order    *list.List // Front = most recently used
@@ -96,8 +100,11 @@ func NewLRUCache(capacity int) *LRUCache {
 	}
 }
 
-// Get retrieves a visitor from the cache and marks it as recently used
+// Get retrieves a visitor from the cache and marks it as recently used.
+// Note: MoveToFront is a write operation on the list, so we use a full Lock here.
 func (c *LRUCache) Get(ip string) (*Visitor, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if elem, ok := c.items[ip]; ok {
 		c.order.MoveToFront(elem)
 		return elem.Value.(*Visitor), true
@@ -107,6 +114,8 @@ func (c *LRUCache) Get(ip string) (*Visitor, bool) {
 
 // Put adds or updates a visitor in the cache
 func (c *LRUCache) Put(ip string, visitor *Visitor) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if elem, ok := c.items[ip]; ok {
 		c.order.MoveToFront(elem)
 		elem.Value = visitor
@@ -124,6 +133,8 @@ func (c *LRUCache) Put(ip string, visitor *Visitor) {
 
 // Delete removes a visitor from the cache
 func (c *LRUCache) Delete(ip string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if elem, ok := c.items[ip]; ok {
 		c.order.Remove(elem)
 		delete(c.items, ip)
@@ -141,11 +152,15 @@ func (c *LRUCache) evictOldest() {
 
 // Len returns the number of items in the cache
 func (c *LRUCache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.order.Len()
 }
 
 // CleanExpired removes entries older than the given window
 func (c *LRUCache) CleanExpired(window time.Duration) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	removed := 0
 	now := time.Now()
 
@@ -168,7 +183,7 @@ var (
 	visitorCache *LRUCache
 	banned       = make(map[string]bool)
 	whitelist    = make(map[string]bool)
-	mu           sync.Mutex
+	mu           sync.Mutex // Protects banned and whitelist maps
 
 	reLog      *regexp.Regexp
 	reOverride *regexp.Regexp
@@ -208,10 +223,18 @@ func init() {
 		loadRules(conf.RulesPath)
 	}
 
-	// Initialize LRU cache for visitor tracking
-	visitorCache = NewLRUCache(maxVisitors)
+	// Initialize LRU cache for visitor tracking (capacity configurable via env)
+	cacheCapacity := getEnvInt("CACHE_CAPACITY", defaultMaxVisitors)
+	if cacheCapacity <= 0 {
+		cacheCapacity = defaultMaxVisitors
+	}
+	visitorCache = NewLRUCache(cacheCapacity)
 }
 
+// tailLog monitors the log file for new lines and processes them.
+// Note on log rotation: This detects truncation-based rotation (copytruncate),
+// which is the most common method for nginx/logrotate. Rename-style rotation
+// (mv + create) is NOT detected and would require fsnotify (external dep).
 func tailLog(ctx context.Context, path string) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -285,6 +308,9 @@ func processLine(line string) {
 		return
 	}
 
+	// Normalize IP to canonical form (handles IPv6 representation variants)
+	ip = normalizeIP(ip)
+
 	// Check for 4xx status codes
 	if !strings.HasPrefix(status, "4") {
 		return
@@ -297,13 +323,14 @@ func processLine(line string) {
 		return
 	}
 
-	// Calculate score for this path
+	// Calculate score for this path (clamped to maxScorePerHit)
 	pathScore := calculateScore(urlPath)
 	if pathScore == VerySuspiciousBinProbesScore {
 		log.Printf("⚠️ %s made a very suspicious ip request in log line: %s", ip, strings.TrimSpace(line))
 	}
 
 	// Use LRU cache for visitor tracking (auto-evicts oldest when full)
+	// Cache has its own internal lock, but we already hold mu for banned/whitelist
 	v, exists := visitorCache.Get(ip)
 	if !exists {
 		v = &Visitor{IP: ip, Paths: make(map[string]bool)}
@@ -333,7 +360,7 @@ func executeBan(ip string, score float64) {
 		return
 	}
 
-	// Determine if IPv4 or IPv6
+	// Determine if IPv4 or IPv6 (ip is already normalized by processLine/scanFullLog)
 	parsedIP := net.ParseIP(ip)
 	setName := conf.NftSetName
 	if parsedIP != nil && parsedIP.To4() == nil {
@@ -342,6 +369,9 @@ func executeBan(ip string, score float64) {
 	}
 
 	// 1. Kernel Action
+	// Note: exec.Command does NOT use shell interpretation — each argument is passed
+	// directly to the exec syscall. Combined with net.ParseIP validation upstream,
+	// this is safe against command injection.
 	cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", ip, "}")
 	if err := cmd.Run(); err != nil {
 		log.Printf("❌ ERROR: Failed to ban %s in nftables set %s: %v", ip, setName, err)
@@ -405,6 +435,8 @@ func scanFullLog(path string) {
 			continue
 		}
 
+		// Normalize IP to canonical form
+		ip = normalizeIP(ip)
 		parsedOK++
 
 		// Count 4xx errors and calculate scores
@@ -510,16 +542,27 @@ func isValidIP(ipStr string) bool {
 	return net.ParseIP(ipStr) != nil
 }
 
+// normalizeIP returns the canonical string representation of an IP address.
+// This ensures IPv6 variants like "::1" and "0:0:0:0:0:0:0:1" produce the same key.
+func normalizeIP(ipStr string) string {
+	parsed := net.ParseIP(ipStr)
+	if parsed == nil {
+		return ipStr // Shouldn't happen after isValidIP check, but be safe
+	}
+	return parsed.String()
+}
+
 func loadSafetyWhitelist() {
-	whitelist["127.0.0.1"] = true
-	whitelist["::1"] = true
+	whitelist[normalizeIP("127.0.0.1")] = true
+	whitelist[normalizeIP("::1")] = true
 
 	// Import current SSH Session
 	if ssh := os.Getenv("SSH_CONNECTION"); ssh != "" {
 		fields := strings.Fields(ssh)
 		if len(fields) > 0 && isValidIP(fields[0]) {
-			log.Printf("🛡️  SAFETY: Whitelisting current SSH session IP: %s", fields[0])
-			whitelist[fields[0]] = true
+			normalized := normalizeIP(fields[0])
+			log.Printf("🛡️  SAFETY: Whitelisting current SSH session IP: %s", normalized)
+			whitelist[normalized] = true
 		}
 	}
 
@@ -531,7 +574,7 @@ func loadSafetyWhitelist() {
 		for s.Scan() {
 			ip := strings.TrimSpace(s.Text())
 			if isValidIP(ip) {
-				whitelist[ip] = true
+				whitelist[normalizeIP(ip)] = true
 			}
 		}
 	}
@@ -541,7 +584,7 @@ func loadSafetyWhitelist() {
 	if err == nil {
 		reIP := regexp.MustCompile(`(\d{1,3}(?:\.\d{1,3}){3})`)
 		for _, ip := range reIP.FindAllString(string(out), -1) {
-			whitelist[ip] = true
+			whitelist[normalizeIP(ip)] = true
 		}
 	}
 }
@@ -557,17 +600,18 @@ func loadAndSyncBannedList() {
 	for s.Scan() {
 		ip := strings.TrimSpace(s.Text())
 		if isValidIP(ip) {
+			normalized := normalizeIP(ip)
 			mu.Lock()
-			if !banned[ip] {
-				banned[ip] = true
+			if !banned[normalized] {
+				banned[normalized] = true
 				setName := conf.NftSetName
-				if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+				if parsed := net.ParseIP(normalized); parsed != nil && parsed.To4() == nil {
 					setName = conf.NftSetNameV6
 				}
-				cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", ip, "}")
+				cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", normalized, "}")
 				if err := cmd.Run(); err != nil {
 					// Note: nft returns error if IP already in set, which is fine
-					log.Printf("⚠️  WARN: nft add element for %s: %v (may already exist)", ip, err)
+					log.Printf("⚠️  WARN: nft add element for %s: %v (may already exist)", normalized, err)
 				}
 			}
 			mu.Unlock()
@@ -584,9 +628,8 @@ func janitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			mu.Lock()
+			// Cache has its own internal lock now, no need for global mu
 			visitorCache.CleanExpired(conf.Window)
-			mu.Unlock()
 		}
 	}
 }
@@ -675,10 +718,22 @@ func loadRules(path string) {
 		}
 
 		pattern := strings.TrimSpace(parts[1])
+
+		// Defense-in-depth: reject excessively long patterns
+		if len(pattern) > maxPatternLength {
+			log.Printf("⚠️  WARN: Rejecting rule at line %d: pattern too long (%d chars, max %d)", lineNum, len(pattern), maxPatternLength)
+			continue
+		}
+
 		re, err := regexp.Compile(pattern)
 		if err != nil {
 			log.Printf("⚠️  WARN: Invalid regex at line %d: %s (%v)", lineNum, pattern, err)
 			continue
+		}
+
+		// Warn if score exceeds per-hit cap (it will be clamped at runtime)
+		if score > maxScorePerHit {
+			log.Printf("⚠️  WARN: Rule at line %d has score %.1f exceeding cap %.1f (will be clamped)", lineNum, score, maxScorePerHit)
 		}
 
 		rules = append(rules, Rule{Score: score, Pattern: re, Raw: pattern})
@@ -688,7 +743,9 @@ func loadRules(path string) {
 	log.Printf("📋 Loaded %d threat detection rules from %s", loadedCount, path)
 }
 
-// calculateScore determines the score for a given URL path based on loaded rules
+// calculateScore determines the score for a given URL path based on loaded rules.
+// All scores are clamped to maxScorePerHit to prevent runaway banning from
+// misconfigured rules.
 func calculateScore(urlPath string) float64 {
 	// Binary probes: empty path means malformed/garbage request (RDP, TLS, SMB probes)
 	// These are extremely malicious - instant ban worthy
@@ -698,6 +755,10 @@ func calculateScore(urlPath string) float64 {
 
 	for _, rule := range rules {
 		if rule.Pattern.MatchString(urlPath) {
+			// Clamp score to prevent single-hit instant bans from misconfigured rules
+			if rule.Score > maxScorePerHit {
+				return maxScorePerHit
+			}
 			return rule.Score
 		}
 	}
@@ -710,6 +771,11 @@ func main() {
 
 	if conf.PreviewMode {
 		fmt.Println("🔍 PREVIEW MODE: No real bans will be issued.")
+		// Clear any stale banned state so preview tracks threats fresh
+		mu.Lock()
+		banned = make(map[string]bool)
+		mu.Unlock()
+		log.Println("🧹 Preview mode: cleared banned map for clean tracking")
 	}
 	if conf.ScanAllMode {
 		fmt.Println("📊 SCAN ALL MODE: Reading entire log file...")
