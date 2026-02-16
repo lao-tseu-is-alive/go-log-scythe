@@ -853,3 +853,8 @@
 61.245.11.87 - - [22/Jan/2026:00:34:09 +0100] "GET /index.php?lang=../../../../../../../../usr/local/lib/php/pearcmd&+config-create+/&/<?echo(md5(\x22hi\x22));?>+/tmp/index1.php HTTP/1.1" 404 146 "-" "libredtail-http"
 61.245.11.87 - - [22/Jan/2026:00:34:09 +0100] "GET /index.php?lang=../../../../../../../../tmp/index1 HTTP/1.1" 404 146 "-" "libredtail-http"
 61.245.11.87 - - [22/Jan/2026:00:34:10 +0100] "GET /containers/json HTTP/1.1" 404 146 "-" "libredtail-http"
+206.168.34.126 - - [10/Feb/2026:07:13:31 +0000] "GET / HTTP/1.1" 200 321 "-" "Mozilla/5.0 (compatible; CensysInspect/1.1; +https://about.censys.io/)"
+206.168.34.126 - - [10/Feb/2026:07:13:33 +0000] "PRI * HTTP/2.0" 400 166 "-" "-"
+206.168.34.126 - - [10/Feb/2026:07:13:33 +0000] "GET /favicon.ico HTTP/1.1" 404 134 "-" "Mozilla/5.0 (compatible; CensysInspect/1.1; +https://about.censys.io/)"
+206.168.34.126 - - [10/Feb/2026:07:13:36 +0000] "\x16\x03\x01\x00\xFF\x01\x00\x00\xFB\x03\x03\x8B\x15\x04\xC8\xCFB\xA2\x9BqUp\xAE\x91r[S*\xAA\xAEE\xC0\xACDG\x1Dq\xE5;\x85\xE4A\xFF \xD5\xE8\xD2/#\xED\x9A\x13" 400 166 "-" "-"
+71.6.134.234 - - [16/Feb/2026:13:00:04 +0000] "\x16\x03\x01\x00\xEC\x01\x00\x00\xE8\x03\x03u>0?\x9F)\xEB(^,\x14\x90qA\xFEHJ\x94S\x17\xB0l\xF4" 400 166 "-" "-"

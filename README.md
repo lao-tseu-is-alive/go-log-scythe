@@ -22,6 +22,7 @@ Unlike legacy tools or shell scripts, **LogScythe** uses lookup tables, meaning 
 * **Safety First:** Automatic whitelisting of your current SSH session, localhost, and existing UFW rules.
 * **Dual-Regex Fallback:** Intelligent parsing logic that supports Nginx and Apache formats out of the box.
 * **Custom Log Format Support:** Override the default regex via `REGEX_OVERRIDE` to parse JSON, syslog, or any custom log format.
+* **Nftables Range Pre-Check:** Automatically detects IPs already covered by broad CIDR ranges in your `nftables.conf`, skipping redundant kernel commands and warning about potential nftables service issues (v0.3.1+).
 * **Persistence:** Bans survive reboots via a local state file and automatic kernel re-synchronization.
 * **Preview Mode:** Test your configuration against live logs without actually triggering firewall actions.
 * **Environment Driven:** Fully configurable via `.env` or system environment variables.
@@ -172,7 +173,7 @@ Define your threat detection patterns in `rules.conf`:
 Attackers often send binary protocol probes to web ports hoping to find exposed services:
 
 | Probe Type | Pattern | Detection |
-|------------|---------|-----------| 
+|------------|---------|-----------|
 | **RDP** | `\x03\x00\x00/*\xE0...mstshash=Administr` | Instant ban |
 | **TLS Handshake** | `\x16\x03\x01...` | Instant ban |
 | **SMB** | `\x00\x00\x00\xFFSMB...` | Instant ban |
@@ -326,6 +327,7 @@ sudo PREVIEW_MODE=true SCAN_ALL_MODE=true ./goLogScythe
 | `BAN_WINDOW` | `15m` | Sliding window duration for score tracking |
 | `NFT_SET_NAME` | `parasites` | The name of the nftables set for IPv4 |
 | `NFT_SET_NAME_V6` | `parasites6` | The name of the nftables set for IPv6 |
+| `NFTABLES_CONF_PATH` | `/etc/nftables.conf` | Path to nftables config for CIDR range pre-check (v0.3.1+) |
 | `CACHE_CAPACITY` | `10000` | Maximum number of visitor IPs tracked simultaneously (v0.3.0+) |
 | `REGEX_OVERRIDE` | `""` | Custom regex for log parsing (see [Custom Log Formats](#-custom-log-formats-regex_override)) |
 | `PREVIEW_MODE` | `false` | If true, logs actions but skips firewall commands (clears banned map on start) |

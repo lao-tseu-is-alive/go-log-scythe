@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.1] - 2026-02-16
+
+### Added
+- **Nftables CIDR range pre-check** — `loadNftablesRanges()` parses CIDR ranges from the nftables config file before syncing banned IPs to the kernel. IPs already covered by a broad subnet rule (e.g., `216.180.246.83` ∈ `216.180.246.0/24`) skip the `nft add element` command, avoiding redundant errors.
+- **Warning for potential nftables service issues** — if a banned IP is covered by an existing nftables range, a ⚠️ warning is logged suggesting the nftables service may not be running (since traffic from that range should already be blocked).
+- **`NFTABLES_CONF_PATH` environment variable** (default: `/etc/nftables.conf`) — configurable path to the nftables config file for CIDR range extraction.
+- **`isIPCoveredByRanges()` helper** — returns the matching `*net.IPNet` for clean, informative warning messages.
+- **6 new tests** — `TestLoadNftablesRanges`, `TestLoadNftablesRangesMultipleCIDRsPerLine`, `TestLoadNftablesRangesMissingFile`, `TestLoadNftablesRangesInvalidCIDR`, `TestIsIPCoveredByRanges`, `TestLoadAndSyncBannedListWithNftRanges`.
+
+### Changed
+- `loadAndSyncBannedList()` now accepts `[]*net.IPNet` parameter for range-aware syncing.
+- CIDR regex uses `FindAllString` to capture multiple CIDRs per line (handles comma-separated nftables elements).
+- Mask portion of CIDR regex limited to `/\d{1,2}` to reject nonsensical values like `/999`.
+
+---
+
 ## [0.3.0] - 2026-02-16
 
 ### Added

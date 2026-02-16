@@ -527,7 +527,7 @@ func TestLoadAndSyncBannedList(t *testing.T) {
 		conf.PreviewMode = originalPreview
 	}()
 
-	loadAndSyncBannedList()
+	loadAndSyncBannedList(nil)
 
 	// Check that valid IPs were loaded
 	mu.Lock()
@@ -561,7 +561,7 @@ func TestLoadAndSyncBannedListMissingFile(t *testing.T) {
 	defer func() { conf.BannedPath = originalPath }()
 
 	// Should not panic on missing file
-	loadAndSyncBannedList()
+	loadAndSyncBannedList(nil)
 
 	mu.Lock()
 	if len(banned) != 0 {
@@ -594,7 +594,7 @@ func TestLoadAndSyncBannedListWithIPv6(t *testing.T) {
 		conf.PreviewMode = originalPreview
 	}()
 
-	loadAndSyncBannedList()
+	loadAndSyncBannedList(nil)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -964,6 +964,204 @@ func TestCacheCapacityEnvVar(t *testing.T) {
 	}
 
 	if cache.Len() != 5 {
-		t.Errorf("Cache with capacity 5 has %d items after 10 inserts, want 5", cache.Len())
+		t.Errorf("Cache should cap at 5 entries, got %d", cache.Len())
+	}
+}
+
+// --- loadNftablesRanges Tests ---
+
+func TestLoadNftablesRanges(t *testing.T) {
+	tmpDir := t.TempDir()
+	nftFile := filepath.Join(tmpDir, "nftables.conf")
+	content := `#!/usr/sbin/nft -f
+flush ruleset
+table inet filter {
+	set parasites {
+		type ipv4_addr
+		flags interval
+		elements = {
+			10.0.0.0/8,
+			192.168.1.0/24,
+			172.16.0.0/12
+		}
+	}
+	chain input {
+		type filter hook input priority 0; policy drop;
+		tcp dport 22 ip saddr 1.2.3.4 accept
+	}
+}
+`
+	if err := os.WriteFile(nftFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp nftables file: %v", err)
+	}
+
+	ranges, err := loadNftablesRanges(nftFile)
+	if err != nil {
+		t.Fatalf("loadNftablesRanges() returned error: %v", err)
+	}
+
+	if len(ranges) != 3 {
+		t.Fatalf("loadNftablesRanges() returned %d ranges, want 3", len(ranges))
+	}
+
+	// Verify specific ranges were parsed
+	expected := []string{"10.0.0.0/8", "192.168.1.0/24", "172.16.0.0/12"}
+	for i, exp := range expected {
+		if ranges[i].String() != exp {
+			t.Errorf("Range %d = %s, want %s", i, ranges[i].String(), exp)
+		}
+	}
+
+	// Verify containment check works
+	ip := net.ParseIP("10.1.2.3")
+	if isIPCoveredByRanges(ip, ranges) == nil {
+		t.Error("10.1.2.3 should be covered by 10.0.0.0/8")
+	}
+
+	ip = net.ParseIP("8.8.8.8")
+	if isIPCoveredByRanges(ip, ranges) != nil {
+		t.Error("8.8.8.8 should NOT be covered by any range")
+	}
+}
+
+func TestLoadNftablesRangesMultipleCIDRsPerLine(t *testing.T) {
+	tmpDir := t.TempDir()
+	nftFile := filepath.Join(tmpDir, "nftables.conf")
+	// Simulate multiple CIDRs on one line (comma-separated as in nftables)
+	content := `elements = { 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12 }
+`
+	if err := os.WriteFile(nftFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp nftables file: %v", err)
+	}
+
+	ranges, err := loadNftablesRanges(nftFile)
+	if err != nil {
+		t.Fatalf("loadNftablesRanges() returned error: %v", err)
+	}
+
+	if len(ranges) != 3 {
+		t.Errorf("loadNftablesRanges() returned %d ranges from one line, want 3", len(ranges))
+	}
+}
+
+func TestLoadNftablesRangesMissingFile(t *testing.T) {
+	ranges, err := loadNftablesRanges("/nonexistent/nftables.conf")
+	if err == nil {
+		t.Error("loadNftablesRanges() should return error for missing file")
+	}
+	if len(ranges) != 0 {
+		t.Errorf("loadNftablesRanges() should return empty slice for missing file, got %d", len(ranges))
+	}
+}
+
+func TestLoadNftablesRangesInvalidCIDR(t *testing.T) {
+	tmpDir := t.TempDir()
+	nftFile := filepath.Join(tmpDir, "nftables.conf")
+	// Mix valid and invalid CIDRs (999.999.999.999/24 will match the regex but fail ParseCIDR)
+	content := `elements = { 10.0.0.0/8, 999.999.999.999/24, 192.168.1.0/24 }
+`
+	if err := os.WriteFile(nftFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp nftables file: %v", err)
+	}
+
+	ranges, err := loadNftablesRanges(nftFile)
+	if err != nil {
+		t.Fatalf("loadNftablesRanges() returned error: %v", err)
+	}
+
+	// Only 2 valid CIDRs should be parsed (the 999.x one is skipped by net.ParseCIDR)
+	if len(ranges) != 2 {
+		t.Errorf("loadNftablesRanges() returned %d ranges, want 2 (invalid CIDR should be skipped)", len(ranges))
+	}
+}
+
+func TestIsIPCoveredByRanges(t *testing.T) {
+	_, net1, _ := net.ParseCIDR("192.168.1.0/24")
+	_, net2, _ := net.ParseCIDR("10.0.0.0/8")
+	ranges := []*net.IPNet{net1, net2}
+
+	tests := []struct {
+		name    string
+		ip      string
+		want    bool
+		wantNet string
+	}{
+		{"covered by /24", "192.168.1.50", true, "192.168.1.0/24"},
+		{"covered by /8", "10.99.88.77", true, "10.0.0.0/8"},
+		{"not covered", "8.8.8.8", false, ""},
+		{"edge of range", "192.168.1.0", true, "192.168.1.0/24"},
+		{"just outside range", "192.168.2.1", false, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed := net.ParseIP(tt.ip)
+			result := isIPCoveredByRanges(parsed, ranges)
+			if tt.want && result == nil {
+				t.Errorf("isIPCoveredByRanges(%s) = nil, want %s", tt.ip, tt.wantNet)
+			}
+			if !tt.want && result != nil {
+				t.Errorf("isIPCoveredByRanges(%s) = %s, want nil", tt.ip, result.String())
+			}
+			if tt.want && result != nil && result.String() != tt.wantNet {
+				t.Errorf("isIPCoveredByRanges(%s) = %s, want %s", tt.ip, result.String(), tt.wantNet)
+			}
+		})
+	}
+
+	// nil ranges should not panic
+	result := isIPCoveredByRanges(net.ParseIP("1.2.3.4"), nil)
+	if result != nil {
+		t.Error("isIPCoveredByRanges with nil ranges should return nil")
+	}
+}
+
+func TestLoadAndSyncBannedListWithNftRanges(t *testing.T) {
+	// Reset global state
+	mu.Lock()
+	banned = make(map[string]bool)
+	mu.Unlock()
+
+	// Create a temp banned file with some IPs covered by ranges and some not
+	tmpDir := t.TempDir()
+	bannedFile := filepath.Join(tmpDir, "banned_ips.txt")
+	content := "192.168.1.50\n192.168.1.100\n10.20.30.40\n8.8.8.8\n"
+	if err := os.WriteFile(bannedFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp banned file: %v", err)
+	}
+
+	// Create nftables ranges that cover 192.168.1.0/24
+	_, net1, _ := net.ParseCIDR("192.168.1.0/24")
+	nftRanges := []*net.IPNet{net1}
+
+	// Temporarily override config
+	originalPath := conf.BannedPath
+	originalPreview := conf.PreviewMode
+	conf.BannedPath = bannedFile
+	conf.PreviewMode = true // Skip actual nft commands
+	defer func() {
+		conf.BannedPath = originalPath
+		conf.PreviewMode = originalPreview
+	}()
+
+	loadAndSyncBannedList(nftRanges)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// IPs covered by range should still be in banned map (marked in memory)
+	if !banned["192.168.1.50"] {
+		t.Error("IP 192.168.1.50 (covered by range) should still be in banned map")
+	}
+	if !banned["192.168.1.100"] {
+		t.Error("IP 192.168.1.100 (covered by range) should still be in banned map")
+	}
+
+	// IPs NOT covered by range should also be in banned map (added normally)
+	if !banned["10.20.30.40"] {
+		t.Error("IP 10.20.30.40 (not covered by range) should be in banned map")
+	}
+	if !banned["8.8.8.8"] {
+		t.Error("IP 8.8.8.8 (not covered by range) should be in banned map")
 	}
 }

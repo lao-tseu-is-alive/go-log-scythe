@@ -29,7 +29,7 @@ import (
 const (
 	APP                          = "goLogScythe"
 	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.3.0"
+	VERSION                      = "0.3.1"
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
@@ -40,6 +40,7 @@ const (
 	defaultWindow                = 15 * time.Minute
 	defaultNftSet                = "parasites"
 	defaultNftSetV6              = "parasites6"
+	defaultNftablesConfPath      = "/etc/nftables.conf"
 	defaultMaxVisitors           = 10000 // Maximum visitors to track before eviction
 	VerySuspiciousBinProbesScore = 12.666
 	maxScorePerHit               = 20.0 // Maximum score any single hit can contribute
@@ -61,18 +62,19 @@ type Rule struct {
 }
 
 type Config struct {
-	LogPath       string
-	WhitelistPath string
-	BannedPath    string
-	RulesPath     string  // Path to rules.conf file
-	BanThreshold  float64 // Score threshold for banning (default: 10.0)
-	RepeatPenalty float64 // Score multiplier for repeat path hits (default: 0.1)
-	Window        time.Duration
-	NftSetName    string
-	NftSetNameV6  string
-	RegexOverride string
-	PreviewMode   bool
-	ScanAllMode   bool
+	LogPath          string
+	WhitelistPath    string
+	BannedPath       string
+	RulesPath        string  // Path to rules.conf file
+	NftablesConfPath string  // Path to nftables.conf for CIDR range checking
+	BanThreshold     float64 // Score threshold for banning (default: 10.0)
+	RepeatPenalty    float64 // Score multiplier for repeat path hits (default: 0.1)
+	Window           time.Duration
+	NftSetName       string
+	NftSetNameV6     string
+	RegexOverride    string
+	PreviewMode      bool
+	ScanAllMode      bool
 }
 
 type Visitor struct {
@@ -183,7 +185,8 @@ var (
 	visitorCache *LRUCache
 	banned       = make(map[string]bool)
 	whitelist    = make(map[string]bool)
-	mu           sync.Mutex // Protects banned and whitelist maps
+	mu           sync.Mutex   // Protects banned and whitelist maps
+	nftRanges    []*net.IPNet // Loaded nftables CIDR ranges for pre-check
 
 	reLog      *regexp.Regexp
 	reOverride *regexp.Regexp
@@ -193,18 +196,19 @@ var (
 func init() {
 	// Initialize configuration from Environment Variables
 	conf = Config{
-		LogPath:       getEnv("LOG_PATH", defaultLogPath),
-		WhitelistPath: getEnv("WHITE_LIST_PATH", defaultWhitelistPath),
-		BannedPath:    getEnv("BANNED_FILE_PATH", defaultBannedPath),
-		RulesPath:     getEnv("RULES_PATH", defaultRulesPath),
-		BanThreshold:  getEnvFloat("BAN_THRESHOLD", defaultThreshold),
-		RepeatPenalty: getEnvFloat("REPEAT_PENALTY", defaultRepeatPenalty),
-		Window:        getEnvDuration("BAN_WINDOW", defaultWindow),
-		NftSetName:    getEnv("NFT_SET_NAME", defaultNftSet),
-		NftSetNameV6:  getEnv("NFT_SET_NAME_V6", defaultNftSetV6),
-		RegexOverride: os.Getenv("REGEX_OVERRIDE"),
-		PreviewMode:   getEnvBool("PREVIEW_MODE", false),
-		ScanAllMode:   getEnvBool("SCAN_ALL_MODE", false),
+		LogPath:          getEnv("LOG_PATH", defaultLogPath),
+		WhitelistPath:    getEnv("WHITE_LIST_PATH", defaultWhitelistPath),
+		BannedPath:       getEnv("BANNED_FILE_PATH", defaultBannedPath),
+		RulesPath:        getEnv("RULES_PATH", defaultRulesPath),
+		BanThreshold:     getEnvFloat("BAN_THRESHOLD", defaultThreshold),
+		RepeatPenalty:    getEnvFloat("REPEAT_PENALTY", defaultRepeatPenalty),
+		Window:           getEnvDuration("BAN_WINDOW", defaultWindow),
+		NftSetName:       getEnv("NFT_SET_NAME", defaultNftSet),
+		NftSetNameV6:     getEnv("NFT_SET_NAME_V6", defaultNftSetV6),
+		NftablesConfPath: getEnv("NFTABLES_CONF_PATH", defaultNftablesConfPath),
+		RegexOverride:    os.Getenv("REGEX_OVERRIDE"),
+		PreviewMode:      getEnvBool("PREVIEW_MODE", false),
+		ScanAllMode:      getEnvBool("SCAN_ALL_MODE", false),
 	}
 
 	// Pre-compile Regex
@@ -320,6 +324,15 @@ func processLine(line string) {
 	defer mu.Unlock()
 
 	if whitelist[ip] || banned[ip] {
+		return
+	}
+
+	// Skip IPs already covered by a broad nftables CIDR range
+	parsedIP := net.ParseIP(ip)
+	if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
+		log.Printf("⚠️  WARN: IP %s is already covered by nftables range %s — "+
+			"if traffic from this IP reached the server, verify that nftables service is running",
+			ip, matchingRange.String())
 		return
 	}
 
@@ -482,6 +495,13 @@ func scanFullLog(path string) {
 			if banned[ip] {
 				continue
 			}
+			// Skip IPs already covered by nftables CIDR ranges
+			if matchingRange := isIPCoveredByRanges(net.ParseIP(ip), nftRanges); matchingRange != nil {
+				log.Printf("⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — "+
+					"if traffic from this IP reached the server, verify that nftables service is running",
+					ip, score, matchingRange.String())
+				continue
+			}
 			toBan = append(toBan, ipStat{ip, score})
 		}
 	}
@@ -589,7 +609,48 @@ func loadSafetyWhitelist() {
 	}
 }
 
-func loadAndSyncBannedList() {
+// loadNftablesRanges extracts CIDR ranges (e.g., 192.168.1.0/24) from the nftables config file.
+// These ranges are used to check whether an IP is already covered by a broad subnet rule
+// before issuing individual nft add element commands.
+func loadNftablesRanges(path string) ([]*net.IPNet, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var ranges []*net.IPNet
+	// Regex to find CIDR patterns (e.g., 20.160.0.0/12, 192.168.1.0/24)
+	// Mask limited to 1-2 digits to reject nonsensical values like /999
+	reCIDR := regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}`)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// FindAllString captures all CIDRs on a line (handles comma-separated elements)
+		matches := reCIDR.FindAllString(line, -1)
+		for _, match := range matches {
+			_, network, err := net.ParseCIDR(match)
+			if err == nil {
+				ranges = append(ranges, network)
+			}
+		}
+	}
+	return ranges, scanner.Err()
+}
+
+// isIPCoveredByRanges checks if the given IP falls within any of the provided CIDR ranges.
+// Returns the matching network if found, nil otherwise.
+func isIPCoveredByRanges(ip net.IP, ranges []*net.IPNet) *net.IPNet {
+	for _, r := range ranges {
+		if r.Contains(ip) {
+			return r
+		}
+	}
+	return nil
+}
+
+func loadAndSyncBannedList(nftRanges []*net.IPNet) {
 	file, err := os.Open(conf.BannedPath)
 	if err != nil {
 		return
@@ -601,11 +662,27 @@ func loadAndSyncBannedList() {
 		ip := strings.TrimSpace(s.Text())
 		if isValidIP(ip) {
 			normalized := normalizeIP(ip)
+			parsedIP := net.ParseIP(normalized)
+
+			// Check if this IP is already covered by a broad CIDR range in nftables.conf
+			if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
+				// This is a warning, not info: receiving traffic from a range that should
+				// already be blocked suggests nftables may not be running or misconfigured.
+				log.Printf("⚠️  WARN: IP %s is already covered by nftables range %s — "+
+					"if traffic from this IP reached the server, verify that nftables service is running",
+					normalized, matchingRange.String())
+				// Still mark as banned in memory so tail/scan won't re-process it
+				mu.Lock()
+				banned[normalized] = true
+				mu.Unlock()
+				continue
+			}
+
 			mu.Lock()
 			if !banned[normalized] {
 				banned[normalized] = true
 				setName := conf.NftSetName
-				if parsed := net.ParseIP(normalized); parsed != nil && parsed.To4() == nil {
+				if parsedIP != nil && parsedIP.To4() == nil {
 					setName = conf.NftSetNameV6
 				}
 				cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", normalized, "}")
@@ -795,9 +872,19 @@ func main() {
 	// 1. Safety Phase
 	loadSafetyWhitelist()
 
-	// 2. Sync Phase (Skip kernel sync if in preview)
+	// 2. Load nftables CIDR ranges (always, even in preview — for informational warnings)
+	var err error
+	nftRanges, err = loadNftablesRanges(conf.NftablesConfPath)
+	if err != nil {
+		log.Printf("⚠️  WARN: Cannot read nftables config '%s': %v (skipping range check)", conf.NftablesConfPath, err)
+	}
+	if len(nftRanges) > 0 {
+		log.Printf("📋 Loaded %d CIDR ranges from %s", len(nftRanges), conf.NftablesConfPath)
+	}
+
+	// 3. Sync Phase (Skip kernel sync if in preview)
 	if !conf.PreviewMode {
-		loadAndSyncBannedList()
+		loadAndSyncBannedList(nftRanges)
 	}
 
 	// 3. Scan All Mode - process entire log file first
