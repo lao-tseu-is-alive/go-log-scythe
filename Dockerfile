@@ -42,7 +42,7 @@ COPY --from=builder /app/goLogScythe /usr/local/bin/goLogScythe
 # 4. Copy configuration files
 # Note: We copy rules.conf as a base, but users can mount
 # their own over it using a Docker volume (-v).
-COPY deploy/rules.conf /var/lib/go-log-scythe/rules.conf
+COPY deploy/go-log-scythe/rules.conf /var/lib/go-log-scythe/rules.conf
 COPY deploy/nftables.conf /etc/nftables.conf
 
 
@@ -53,10 +53,10 @@ RUN touch /var/log/nginx/access.log && \
 
 # 6. Create an entrypoint script to manage both Nginx and GoLogScythe
 # This is how we "manage the final stage" to run both processes
+# exec ensures the Go app becomes PID 1, receiving Unix signals correctly
 RUN echo '#!/bin/sh \n\
 nft -f /etc/nftables.conf \n\
 nginx \n\
-# exec ensures the Go app becomes PID 1, receiving Unix signals correctly
 exec /usr/local/bin/goLogScythe' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Expose Nginx ports
