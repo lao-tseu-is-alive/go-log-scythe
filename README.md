@@ -436,7 +436,16 @@ User=root
 WorkingDirectory=/var/lib/go-log-scythe
 ExecStart=/usr/local/bin/goLogScythe-linux-amd64
 Restart=always
-EnvironmentFile=/var/lib/go-log-scythe/.env
+RestartSec=5
+
+# Load configuration
+EnvironmentFile=/etc/go-log-scythe/config.env
+
+# Hardening attributes
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/var/log/nginx/
 
 [Install]
 WantedBy=multi-user.target
