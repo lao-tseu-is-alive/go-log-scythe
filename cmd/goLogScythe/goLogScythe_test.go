@@ -15,6 +15,12 @@ import (
 	"time"
 )
 
+const (
+	failedCreateLogFile    = "Failed to create temp log file: %v"
+	failedTempFileCreation = "Failed to create temp banned file: %v"
+	failedCreateNftFile    = "Failed to create temp nftables file: %v"
+)
+
 // --- Environment Variable Helper Tests ---
 
 func TestGetEnv(t *testing.T) {
@@ -511,10 +517,10 @@ func TestLoadAndSyncBannedList(t *testing.T) {
 
 	// Create a temp banned file
 	tmpDir := t.TempDir()
-	bannedFile := filepath.Join(tmpDir, "banned_ips.txt")
+	bannedFile := filepath.Join(tmpDir, defaultBannedPath)
 	content := "192.168.100.1\n192.168.100.2\ninvalid_ip\n10.20.30.40\n"
 	if err := os.WriteFile(bannedFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create temp banned file: %v", err)
+		t.Fatalf(failedTempFileCreation, err)
 	}
 
 	// Temporarily override config
@@ -578,10 +584,10 @@ func TestLoadAndSyncBannedListWithIPv6(t *testing.T) {
 
 	// Create a temp banned file with IPv6 addresses
 	tmpDir := t.TempDir()
-	bannedFile := filepath.Join(tmpDir, "banned_ips.txt")
+	bannedFile := filepath.Join(tmpDir, defaultBannedPath)
 	content := "192.168.1.1\n2001:db8::1\nfe80::1\n"
 	if err := os.WriteFile(bannedFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create temp banned file: %v", err)
+		t.Fatalf(failedTempFileCreation, err)
 	}
 
 	// Temporarily override config
@@ -640,7 +646,7 @@ func TestScanFullLog(t *testing.T) {
 	logContent += `127.0.0.1 - - [16/Jan/2026:10:00:00 +0000] "GET /admin HTTP/1.1" 404 123` + "\n"
 
 	if err := os.WriteFile(logFile, []byte(logContent), 0644); err != nil {
-		t.Fatalf("Failed to create temp log file: %v", err)
+		t.Fatalf(failedCreateLogFile, err)
 	}
 
 	// Temporarily override config - use NON-preview mode but we won't have nft
@@ -690,7 +696,7 @@ func TestScanFullLogEmptyFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	logFile := filepath.Join(tmpDir, "empty.log")
 	if err := os.WriteFile(logFile, []byte(""), 0644); err != nil {
-		t.Fatalf("Failed to create temp log file: %v", err)
+		t.Fatalf(failedCreateLogFile, err)
 	}
 
 	originalPreview := conf.PreviewMode
@@ -723,7 +729,7 @@ func TestScanFullLogWhitelistedIP(t *testing.T) {
 		logContent += `192.168.1.99 - - [16/Jan/2026:10:00:00 +0000] "GET /admin HTTP/1.1" 404 123` + "\n"
 	}
 	if err := os.WriteFile(logFile, []byte(logContent), 0644); err != nil {
-		t.Fatalf("Failed to create temp log file: %v", err)
+		t.Fatalf(failedCreateLogFile, err)
 	}
 
 	originalPreview := conf.PreviewMode
@@ -972,7 +978,7 @@ func TestCacheCapacityEnvVar(t *testing.T) {
 
 func TestLoadNftablesRanges(t *testing.T) {
 	tmpDir := t.TempDir()
-	nftFile := filepath.Join(tmpDir, "nftables.conf")
+	nftFile := filepath.Join(tmpDir, defaultNftConf)
 	content := `#!/usr/sbin/nft -f
 flush ruleset
 table inet filter {
@@ -992,12 +998,12 @@ table inet filter {
 }
 `
 	if err := os.WriteFile(nftFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create temp nftables file: %v", err)
+		t.Fatalf(failedCreateNftFile, err)
 	}
 
 	ranges, err := loadNftablesRanges(nftFile)
 	if err != nil {
-		t.Fatalf("loadNftablesRanges() returned error: %v", err)
+		t.Fatalf(msgFuncNReturnedError, "loadNftablesRanges", err)
 	}
 
 	if len(ranges) != 3 {
@@ -1026,17 +1032,17 @@ table inet filter {
 
 func TestLoadNftablesRangesMultipleCIDRsPerLine(t *testing.T) {
 	tmpDir := t.TempDir()
-	nftFile := filepath.Join(tmpDir, "nftables.conf")
+	nftFile := filepath.Join(tmpDir, defaultNftConf)
 	// Simulate multiple CIDRs on one line (comma-separated as in nftables)
 	content := `elements = { 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12 }
 `
 	if err := os.WriteFile(nftFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create temp nftables file: %v", err)
+		t.Fatalf(failedCreateNftFile, err)
 	}
 
 	ranges, err := loadNftablesRanges(nftFile)
 	if err != nil {
-		t.Fatalf("loadNftablesRanges() returned error: %v", err)
+		t.Fatalf(msgFuncNReturnedError, "loadNftablesRanges", err)
 	}
 
 	if len(ranges) != 3 {
@@ -1056,17 +1062,17 @@ func TestLoadNftablesRangesMissingFile(t *testing.T) {
 
 func TestLoadNftablesRangesInvalidCIDR(t *testing.T) {
 	tmpDir := t.TempDir()
-	nftFile := filepath.Join(tmpDir, "nftables.conf")
+	nftFile := filepath.Join(tmpDir, defaultNftConf)
 	// Mix valid and invalid CIDRs (999.999.999.999/24 will match the regex but fail ParseCIDR)
 	content := `elements = { 10.0.0.0/8, 999.999.999.999/24, 192.168.1.0/24 }
 `
 	if err := os.WriteFile(nftFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create temp nftables file: %v", err)
+		t.Fatalf(failedCreateNftFile, err)
 	}
 
 	ranges, err := loadNftablesRanges(nftFile)
 	if err != nil {
-		t.Fatalf("loadNftablesRanges() returned error: %v", err)
+		t.Fatalf(msgFuncNReturnedError, "loadNftablesRanges", err)
 	}
 
 	// Only 2 valid CIDRs should be parsed (the 999.x one is skipped by net.ParseCIDR)
@@ -1124,10 +1130,10 @@ func TestLoadAndSyncBannedListWithNftRanges(t *testing.T) {
 
 	// Create a temp banned file with some IPs covered by ranges and some not
 	tmpDir := t.TempDir()
-	bannedFile := filepath.Join(tmpDir, "banned_ips.txt")
+	bannedFile := filepath.Join(tmpDir, defaultBannedPath)
 	content := "192.168.1.50\n192.168.1.100\n10.20.30.40\n8.8.8.8\n"
 	if err := os.WriteFile(bannedFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create temp banned file: %v", err)
+		t.Fatalf(failedTempFileCreation, err)
 	}
 
 	// Create nftables ranges that cover 192.168.1.0/24

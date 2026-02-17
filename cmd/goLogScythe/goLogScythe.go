@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -34,14 +35,14 @@ const (
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
-	defaultBannedPath            = "./banned_ips.txt"
+	defaultBannedPath            = "banned_ips.txt"
 	defaultRulesPath             = ""   // Empty means no rules file (backward compatible)
 	defaultThreshold             = 10.0 // Score threshold for banning
 	defaultRepeatPenalty         = 0.1  // 10% of full score for repeat path hits
 	defaultWindow                = 15 * time.Minute
 	defaultNftSet                = "parasites"
 	defaultNftSetV6              = "parasites6"
-	defaultNftablesConfPath      = "/etc/nftables.conf"
+	defaultNftConf               = "nftables.conf"
 	defaultMaxVisitors           = 10000 // Maximum visitors to track before eviction
 	VerySuspiciousBinProbesScore = 12.666
 	maxScorePerHit               = 20.0 // Maximum score any single hit can contribute
@@ -54,7 +55,10 @@ const (
 	// Two-stage: try to extract path, fallback to just IP/status for binary probes
 	defaultLogRegex       = `(?s)^(\S+)\s+-\s+-\s+\[.*?\]\s+"(?:\S+\s+(\S*)\s+.*?|.*?)"\s+(\d{3})`
 	warnIpInExcludedRange = "⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — if traffic from this IP reached the server, verify that nftables service is running"
+	msgFuncNReturnedError = "%v returned error: %v"
 )
+
+var defaultNftablesConfPath = filepath.Join("/etc/", defaultNftConf)
 
 // Rule represents a threat detection rule with a score and regex pattern
 type Rule struct {
