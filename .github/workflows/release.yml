@@ -50,7 +50,9 @@ jobs:
           sha256sum goLogScythe-* > SHA256.txt
 
       - name: Upload Release Asset for Linux/macOS
-        uses: softprops/action-gh-release@v2.2.2
+        # v2.2.2 - pinned to commit SHA to prevent supply chain attacks,
+        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
         with:
           body:  Release${{ env.RELEASE_VERSION }}
           files: |

@@ -32,10 +32,14 @@ jobs:
         run: go test -v ./...
 
       - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@v3
+        # v3 - pinned to commit SHA to prevent supply chain attacks,
+        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Log into registry ${{ env.REGISTRY }}
-        uses: docker/login-action@v3
+        # v3 - pinned to commit SHA to prevent supply chain attacks,
+        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -43,7 +47,9 @@ jobs:
 
       # 1. Build the image locally first for scanning
       - name: Build local image
-        uses: docker/build-push-action@v5
+        # v5 - pinned to commit SHA to prevent supply chain attacks,
+        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
         with:
           context: .
           load: true # This loads the image into the local docker daemon instead of pushing it
@@ -53,7 +59,9 @@ jobs:
 
       # 2. Run your verified Trivy scanner
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        # v0.34.0 - pinned to commit SHA to prevent supply chain attacks,
+        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284
         with:
           image-ref: 'go-log-scythe:test'
           severity: 'MEDIUM,CRITICAL,HIGH'
@@ -70,7 +78,9 @@ jobs:
       # 4. Final Push - Only if previous steps (including scan) succeeded
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        # v5 - pinned to commit SHA to prevent supply chain attacks,
+        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -78,7 +88,9 @@ jobs:
             type=sha
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        # v5 - pinned to commit SHA to prevent supply chain attacks,
+        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
         with:
           context: .
           push: true
