@@ -1,4 +1,8 @@
 # 🛡️ GoLogScythe
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=lao-tseu-is-alive_go-log-scythe&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=lao-tseu-is-alive_go-log-scythe)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=lao-tseu-is-alive_go-log-scythe&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=lao-tseu-is-alive_go-log-scythe)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=lao-tseu-is-alive_go-log-scythe&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=lao-tseu-is-alive_go-log-scythe)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=lao-tseu-is-alive_go-log-scythe&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=lao-tseu-is-alive_go-log-scythe)
 
 [![cve-trivy-scan](https://github.com/lao-tseu-is-alive/go-log-scythe/actions/workflows/cve-trivy-scan.yml/badge.svg)](https://github.com/lao-tseu-is-alive/go-log-scythe/actions/workflows/cve-trivy-scan.yml)
 
