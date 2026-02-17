@@ -35,7 +35,7 @@ for ip in $IPS_TO_CHECK; do
         fi
     done
 
-    if [ "$IS_BANNED" = false ]; then
+    if [[ "$IS_BANNED" = false ]]; then
         # Extract the real count from our TEMP_STATS
         COUNT=$(echo "$TEMP_STATS" | grep " $ip$" | awk '{print $1}')
         echo "🚩 MISSING: $ip ($COUNT unique probe paths) is NOT in firewall!"
