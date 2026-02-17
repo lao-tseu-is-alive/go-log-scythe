@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -285,29 +286,31 @@ func tailLog(ctx context.Context, path string) {
 	}
 }
 
+// matchLogLine tries override regex first, then the default log regex.
+// Returns the parsed IP, URL path, status code, and whether matching succeeded.
+func matchLogLine(line string) (ip, urlPath, status string, ok bool) {
+	if reOverride != nil {
+		ip, urlPath, status, ok = tryMatchWithPath(reOverride, line)
+		if ok && !isValidIP(ip) {
+			log.Fatalf("❌ FATAL: REGEX_OVERRIDE extracted invalid IP: %s", ip)
+		}
+	}
+	if !ok {
+		ip, urlPath, status, ok = tryMatchWithPath(reLog, line)
+	}
+	if !ok || !isValidIP(ip) {
+		return "", "", "", false
+	}
+	return ip, urlPath, status, true
+}
+
 func processLine(line string) {
 	if line == "" {
 		return
 	}
 
-	var ip, urlPath, status string
-	var matched bool
-
-	// 1. Try Override
-	if reOverride != nil {
-		ip, urlPath, status, matched = tryMatchWithPath(reOverride, line)
-		if matched && !isValidIP(ip) {
-			log.Fatalf("❌ FATAL: REGEX_OVERRIDE extracted invalid IP: %s", ip)
-		}
-	}
-
-	// 2. Try default log regex
-	if !matched {
-		ip, urlPath, status, matched = tryMatchWithPath(reLog, line)
-	}
-
-	if !matched || !isValidIP(ip) {
-		// Log a warning for data we can't parse, but keep the program running
+	ip, urlPath, status, ok := matchLogLine(line)
+	if !ok {
 		log.Printf("⚠️  WARN: Skipping unparseable line: %s", strings.TrimSpace(line))
 		return
 	}
@@ -404,6 +407,100 @@ func executeBan(ip string, score float64) {
 	log.Printf("🚫 BANNED: %s (set: %s)", ip, setName)
 }
 
+// ipStat holds an IP address and its cumulative threat score for scan results.
+type ipStat struct {
+	ip    string
+	score float64
+}
+
+// scanStats holds aggregate statistics from scanning a log file.
+type scanStats struct {
+	totalLines int
+	parsedOK   int
+	total4xx   int
+	ipScores   map[string]float64
+}
+
+// scanLogScores reads all lines from the file, parses them, and accumulates per-IP threat scores.
+func scanLogScores(file *os.File) scanStats {
+	stats := scanStats{ipScores: make(map[string]float64)}
+	ipPaths := make(map[string]map[string]bool) // IP -> paths seen (for repeat penalty)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		stats.totalLines++
+
+		ip, urlPath, status, ok := matchLogLine(line)
+		if !ok {
+			continue
+		}
+
+		ip = normalizeIP(ip)
+		stats.parsedOK++
+
+		if !strings.HasPrefix(status, "4") {
+			continue
+		}
+		stats.total4xx++
+
+		// Initialize path tracking for this IP
+		if ipPaths[ip] == nil {
+			ipPaths[ip] = make(map[string]bool)
+		}
+
+		// Calculate score with repeat penalty
+		pathScore := calculateScore(urlPath)
+		if pathScore == VerySuspiciousBinProbesScore {
+			log.Printf("⚠️ %s made a very suspicious ip request in log line: %s", ip, strings.TrimSpace(line))
+		}
+		if ipPaths[ip][urlPath] {
+			pathScore *= conf.RepeatPenalty
+		} else {
+			ipPaths[ip][urlPath] = true
+		}
+
+		stats.ipScores[ip] += pathScore
+	}
+	return stats
+}
+
+// filterBannableIPs returns IPs that exceed the ban threshold, excluding whitelisted,
+// already-banned, and CIDR-covered IPs. Results are sorted by score descending.
+func filterBannableIPs(ipScores map[string]float64) []ipStat {
+	var toBan []ipStat
+	for ip, score := range ipScores {
+		if score < conf.BanThreshold {
+			continue
+		}
+		if whitelist[ip] || banned[ip] {
+			continue
+		}
+		if matchingRange := isIPCoveredByRanges(net.ParseIP(ip), nftRanges); matchingRange != nil {
+			log.Printf("⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — "+
+				"if traffic from this IP reached the server, verify that nftables service is running",
+				ip, score, matchingRange.String())
+			continue
+		}
+		toBan = append(toBan, ipStat{ip, score})
+	}
+	sort.Slice(toBan, func(i, j int) bool {
+		return toBan[i].score > toBan[j].score
+	})
+	return toBan
+}
+
+// printScanResults outputs scan statistics and the list of IPs to ban.
+func printScanResults(stats scanStats, uniqueIPs int, toBan []ipStat) {
+	fmt.Println("📊 Scan Results:")
+	fmt.Printf("   Total lines: %d\n", stats.totalLines)
+	fmt.Printf("   Parsed OK: %d\n", stats.parsedOK)
+	fmt.Printf("   4xx errors: %d\n", stats.total4xx)
+	fmt.Printf("   Unique IPs with 4xx: %d\n", uniqueIPs)
+	fmt.Printf("   IPs exceeding threshold (%.1f): %d\n", conf.BanThreshold, len(toBan))
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+}
+
 // scanFullLog reads the entire log file and processes all lines with weighted scoring
 func scanFullLog(path string) {
 	file, err := os.Open(path)
@@ -415,114 +512,9 @@ func scanFullLog(path string) {
 	fmt.Printf("📖 Scanning %s...\n", path)
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-	// Statistics
-	totalLines := 0
-	parsedOK := 0
-	total4xx := 0
-	ipScores := make(map[string]float64)        // IP -> cumulative score
-	ipPaths := make(map[string]map[string]bool) // IP -> paths seen (for repeat penalty)
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		totalLines++
-
-		if line == "" {
-			continue
-		}
-
-		var ip, urlPath, status string
-		var matched bool
-
-		// Try override regex first
-		if reOverride != nil {
-			ip, urlPath, status, matched = tryMatchWithPath(reOverride, line)
-		}
-
-		// Try default log regex
-		if !matched {
-			ip, urlPath, status, matched = tryMatchWithPath(reLog, line)
-		}
-
-		if !matched || !isValidIP(ip) {
-			continue
-		}
-
-		// Normalize IP to canonical form
-		ip = normalizeIP(ip)
-		parsedOK++
-
-		// Count 4xx errors and calculate scores
-		if strings.HasPrefix(status, "4") {
-			total4xx++
-
-			// Initialize path tracking for this IP
-			if ipPaths[ip] == nil {
-				ipPaths[ip] = make(map[string]bool)
-			}
-
-			// Calculate score with repeat penalty
-			pathScore := calculateScore(urlPath)
-			if pathScore == VerySuspiciousBinProbesScore {
-				log.Printf("⚠️ %s made a very suspicious ip request in log line: %s", ip, strings.TrimSpace(line))
-			}
-			if ipPaths[ip][urlPath] {
-				pathScore *= conf.RepeatPenalty
-			} else {
-				ipPaths[ip][urlPath] = true
-			}
-
-			ipScores[ip] += pathScore
-		}
-	}
-
-	// Collect IPs that exceed threshold
-	type ipStat struct {
-		ip    string
-		score float64
-	}
-	var toBan []ipStat
-	uniqueIPs := 0
-
-	for ip, score := range ipScores {
-		uniqueIPs++
-		if score >= conf.BanThreshold {
-			// Skip whitelisted IPs
-			if whitelist[ip] {
-				continue
-			}
-			// Skip already banned IPs
-			if banned[ip] {
-				continue
-			}
-			// Skip IPs already covered by nftables CIDR ranges
-			if matchingRange := isIPCoveredByRanges(net.ParseIP(ip), nftRanges); matchingRange != nil {
-				log.Printf("⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — "+
-					"if traffic from this IP reached the server, verify that nftables service is running",
-					ip, score, matchingRange.String())
-				continue
-			}
-			toBan = append(toBan, ipStat{ip, score})
-		}
-	}
-
-	// Sort by score descending
-	for i := 0; i < len(toBan)-1; i++ {
-		for j := i + 1; j < len(toBan); j++ {
-			if toBan[j].score > toBan[i].score {
-				toBan[i], toBan[j] = toBan[j], toBan[i]
-			}
-		}
-	}
-
-	// Print results
-	fmt.Println("📊 Scan Results:")
-	fmt.Printf("   Total lines: %d\n", totalLines)
-	fmt.Printf("   Parsed OK: %d\n", parsedOK)
-	fmt.Printf("   4xx errors: %d\n", total4xx)
-	fmt.Printf("   Unique IPs with 4xx: %d\n", uniqueIPs)
-	fmt.Printf("   IPs exceeding threshold (%.1f): %d\n", conf.BanThreshold, len(toBan))
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	stats := scanLogScores(file)
+	toBan := filterBannableIPs(stats.ipScores)
+	printScanResults(stats, len(stats.ipScores), toBan)
 
 	// Process IPs
 	for _, stat := range toBan {
@@ -650,6 +642,19 @@ func isIPCoveredByRanges(ip net.IP, ranges []*net.IPNet) *net.IPNet {
 	return nil
 }
 
+// syncIPToNftSet adds an IP to the appropriate nftables set (IPv4 or IPv6).
+func syncIPToNftSet(normalized string, parsedIP net.IP) {
+	setName := conf.NftSetName
+	if parsedIP != nil && parsedIP.To4() == nil {
+		setName = conf.NftSetNameV6
+	}
+	cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", normalized, "}")
+	if err := cmd.Run(); err != nil {
+		// Note: nft returns error if IP already in set, which is fine
+		log.Printf("⚠️  WARN: nft add element for %s: %v (may already exist)", normalized, err)
+	}
+}
+
 func loadAndSyncBannedList(nftRanges []*net.IPNet) {
 	file, err := os.Open(conf.BannedPath)
 	if err != nil {
@@ -660,39 +665,33 @@ func loadAndSyncBannedList(nftRanges []*net.IPNet) {
 	s := bufio.NewScanner(file)
 	for s.Scan() {
 		ip := strings.TrimSpace(s.Text())
-		if isValidIP(ip) {
-			normalized := normalizeIP(ip)
-			parsedIP := net.ParseIP(normalized)
-
-			// Check if this IP is already covered by a broad CIDR range in nftables.conf
-			if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
-				// This is a warning, not info: receiving traffic from a range that should
-				// already be blocked suggests nftables may not be running or misconfigured.
-				log.Printf("⚠️  WARN: IP %s is already covered by nftables range %s — "+
-					"if traffic from this IP reached the server, verify that nftables service is running",
-					normalized, matchingRange.String())
-				// Still mark as banned in memory so tail/scan won't re-process it
-				mu.Lock()
-				banned[normalized] = true
-				mu.Unlock()
-				continue
-			}
-
-			mu.Lock()
-			if !banned[normalized] {
-				banned[normalized] = true
-				setName := conf.NftSetName
-				if parsedIP != nil && parsedIP.To4() == nil {
-					setName = conf.NftSetNameV6
-				}
-				cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", normalized, "}")
-				if err := cmd.Run(); err != nil {
-					// Note: nft returns error if IP already in set, which is fine
-					log.Printf("⚠️  WARN: nft add element for %s: %v (may already exist)", normalized, err)
-				}
-			}
-			mu.Unlock()
+		if !isValidIP(ip) {
+			continue
 		}
+
+		normalized := normalizeIP(ip)
+		parsedIP := net.ParseIP(normalized)
+
+		// Check if this IP is already covered by a broad CIDR range in nftables.conf
+		if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
+			// This is a warning: receiving traffic from a range that should already
+			// be blocked suggests nftables may not be running or misconfigured.
+			log.Printf("⚠️  WARN: IP %s is already covered by nftables range %s — "+
+				"if traffic from this IP reached the server, verify that nftables service is running",
+				normalized, matchingRange.String())
+			// Still mark as banned in memory so tail/scan won't re-process it
+			mu.Lock()
+			banned[normalized] = true
+			mu.Unlock()
+			continue
+		}
+
+		mu.Lock()
+		if !banned[normalized] {
+			banned[normalized] = true
+			syncIPToNftSet(normalized, parsedIP)
+		}
+		mu.Unlock()
 	}
 }
 
