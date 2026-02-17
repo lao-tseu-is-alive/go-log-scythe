@@ -52,7 +52,8 @@ const (
 	// OR malformed: 1.2.3.4 - - [Date] \"<binary garbage>\" 400 ...
 	// Group 1: IP, Group 2: URL path (may be empty for malformed), Group 3: Status code
 	// Two-stage: try to extract path, fallback to just IP/status for binary probes
-	defaultLogRegex = `(?s)^(\S+)\s+-\s+-\s+\[.*?\]\s+"(?:\S+\s+(\S*)\s+.*?|.*?)"\s+(\d{3})`
+	defaultLogRegex       = `(?s)^(\S+)\s+-\s+-\s+\[.*?\]\s+"(?:\S+\s+(\S*)\s+.*?|.*?)"\s+(\d{3})`
+	warnIpInExcludedRange = "⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — if traffic from this IP reached the server, verify that nftables service is running"
 )
 
 // Rule represents a threat detection rule with a score and regex pattern
@@ -333,9 +334,7 @@ func processLine(line string) {
 	// Skip IPs already covered by a broad nftables CIDR range
 	parsedIP := net.ParseIP(ip)
 	if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
-		log.Printf("⚠️  WARN: IP %s is already covered by nftables range %s — "+
-			"if traffic from this IP reached the server, verify that nftables service is running",
-			ip, matchingRange.String())
+		log.Printf(warnIpInExcludedRange, ip, 0.0, matchingRange.String())
 		return
 	}
 
@@ -477,8 +476,7 @@ func filterBannableIPs(ipScores map[string]float64) []ipStat {
 			continue
 		}
 		if matchingRange := isIPCoveredByRanges(net.ParseIP(ip), nftRanges); matchingRange != nil {
-			log.Printf("⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — "+
-				"if traffic from this IP reached the server, verify that nftables service is running",
+			log.Printf(warnIpInExcludedRange,
 				ip, score, matchingRange.String())
 			continue
 		}
@@ -676,9 +674,7 @@ func loadAndSyncBannedList(nftRanges []*net.IPNet) {
 		if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
 			// This is a warning: receiving traffic from a range that should already
 			// be blocked suggests nftables may not be running or misconfigured.
-			log.Printf("⚠️  WARN: IP %s is already covered by nftables range %s — "+
-				"if traffic from this IP reached the server, verify that nftables service is running",
-				normalized, matchingRange.String())
+			log.Printf(warnIpInExcludedRange, normalized, 0.0, matchingRange.String())
 			// Still mark as banned in memory so tail/scan won't re-process it
 			mu.Lock()
 			banned[normalized] = true
@@ -859,6 +855,7 @@ func main() {
 
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // ← Ensures cleanup when main() exits naturally.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
