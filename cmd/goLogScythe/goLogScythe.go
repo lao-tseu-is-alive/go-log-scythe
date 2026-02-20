@@ -31,7 +31,7 @@ import (
 const (
 	APP                          = "goLogScythe"
 	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.3.4"
+	VERSION                      = "0.4.0"
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
@@ -43,7 +43,10 @@ const (
 	defaultNftSet                = "parasites"
 	defaultNftSetV6              = "parasites6"
 	defaultNftConf               = "nftables.conf"
-	defaultMaxVisitors           = 10000 // Maximum visitors to track before eviction
+	defaultMaxVisitors           = 10000                  // Maximum visitors to track before eviction
+	defaultBurstLimit            = 5                      // Max 4xx hits in burst window before instant ban
+	defaultBurstWindow           = 3 * time.Second        // Sliding window for burst counting
+	defaultTailPollInterval      = 100 * time.Millisecond // Poll interval for tail -f style monitoring
 	VerySuspiciousBinProbesScore = 12.666
 	maxScorePerHit               = 20.0 // Maximum score any single hit can contribute
 	maxPatternLength             = 512  // Maximum regex pattern length in rules.conf
@@ -79,6 +82,9 @@ type Config struct {
 	NftSetName       string
 	NftSetNameV6     string
 	RegexOverride    string
+	BurstLimit       int           // Max 4xx hits in burst window before instant ban (default: 5)
+	BurstWindow      time.Duration // Sliding window for burst counting (default: 3s)
+	TailPollInterval time.Duration // Poll interval for tail -f style monitoring (default: 100ms)
 	PreviewMode      bool
 	ScanAllMode      bool
 }
@@ -87,6 +93,7 @@ type Visitor struct {
 	IP       string
 	Score    float64         // Cumulative danger score
 	Paths    map[string]bool // Track distinct paths for repeat penalty
+	HitTimes []time.Time     // Sliding window of recent 4xx hit timestamps for burst detection
 	LastSeen time.Time
 }
 
@@ -213,6 +220,9 @@ func init() {
 		NftSetNameV6:     getEnv("NFT_SET_NAME_V6", defaultNftSetV6),
 		NftablesConfPath: getEnv("NFTABLES_CONF_PATH", defaultNftablesConfPath),
 		RegexOverride:    os.Getenv("REGEX_OVERRIDE"),
+		BurstLimit:       getEnvInt("BURST_LIMIT", defaultBurstLimit),
+		BurstWindow:      getEnvDuration("BURST_WINDOW", defaultBurstWindow),
+		TailPollInterval: getEnvDuration("TAIL_POLL_INTERVAL", defaultTailPollInterval),
 		PreviewMode:      getEnvBool("PREVIEW_MODE", false),
 		ScanAllMode:      getEnvBool("SCAN_ALL_MODE", false),
 	}
@@ -270,7 +280,7 @@ func tailLog(ctx context.Context, path string) {
 		if err != nil {
 			if err == io.EOF {
 				// Wait for new data
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(conf.TailPollInterval)
 
 				// Check for truncation (log rotation)
 				stats, _ := file.Stat()
@@ -363,7 +373,32 @@ func processLine(line string) {
 	}
 
 	v.Score += pathScore
-	v.LastSeen = time.Now()
+	now := time.Now()
+	v.LastSeen = now
+
+	// Burst detection: track 4xx hit timestamps in a sliding window
+	if conf.BurstLimit > 0 && conf.BurstWindow > 0 {
+		v.HitTimes = append(v.HitTimes, now)
+		// Trim hit times outside the burst window
+		cutoff := now.Add(-conf.BurstWindow)
+		trimIdx := 0
+		for trimIdx < len(v.HitTimes) && v.HitTimes[trimIdx].Before(cutoff) {
+			trimIdx++
+		}
+		if trimIdx > 0 {
+			v.HitTimes = v.HitTimes[trimIdx:]
+		}
+		// Check burst threshold
+		if len(v.HitTimes) >= conf.BurstLimit {
+			log.Printf("⚡ BURST: %s sent %d 4xx requests in %v — triggering instant ban",
+				ip, len(v.HitTimes), conf.BurstWindow)
+			visitorCache.Put(ip, v)
+			executeBan(ip, v.Score)
+			visitorCache.Delete(ip)
+			return
+		}
+	}
+
 	visitorCache.Put(ip, v)
 
 	if v.Score >= conf.BanThreshold {

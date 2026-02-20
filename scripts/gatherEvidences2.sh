@@ -72,7 +72,7 @@ printf '   - %s\n' "${LOG_FILES[@]}"
 # compute missing IPs (unique, sorted)
 LC_ALL=C sort -u "$IP_LIST" >"$missing_list.all"
 LC_ALL=C sort -u "$done_list" >"$missing_list.done"
-comm -23 "$missing_list.all" "$missing_list.done" >"$missing_list"
+LC_ALL=C comm -23 "$missing_list.all" "$missing_list.done" >"$missing_list"
 rm -f "$missing_list.all" "$missing_list.done"
 
 # Extra safety: if evidence file already exists (race/manual), skip it anyway later.

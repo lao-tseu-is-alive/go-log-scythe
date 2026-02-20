@@ -1171,3 +1171,168 @@ func TestLoadAndSyncBannedListWithNftRanges(t *testing.T) {
 		t.Error("IP 8.8.8.8 (not covered by range) should be in banned map")
 	}
 }
+
+// --- Burst Detection Tests ---
+
+func TestBurstDetection(t *testing.T) {
+	// Reset global state
+	mu.Lock()
+	visitorCache = NewLRUCache(defaultMaxVisitors)
+	banned = make(map[string]bool)
+	whitelist = make(map[string]bool)
+	whitelist["127.0.0.1"] = true
+	mu.Unlock()
+
+	// Save and restore original config
+	originalBurstLimit := conf.BurstLimit
+	originalBurstWindow := conf.BurstWindow
+	originalPreview := conf.PreviewMode
+	originalThreshold := conf.BanThreshold
+	conf.BurstLimit = 5
+	conf.BurstWindow = 3 * time.Second
+	conf.PreviewMode = true   // Skip actual nft commands
+	conf.BanThreshold = 100.0 // Set very high so only burst triggers the ban
+	defer func() {
+		conf.BurstLimit = originalBurstLimit
+		conf.BurstWindow = originalBurstWindow
+		conf.PreviewMode = originalPreview
+		conf.BanThreshold = originalThreshold
+	}()
+
+	// Send 5 rapid-fire 4xx lines from the same IP (each scores 1.0 default)
+	// With threshold at 100, only burst detection can trigger the ban
+	for i := 0; i < 5; i++ {
+		line := fmt.Sprintf(`10.99.99.99 - - [20/Feb/2026:10:00:0%d +0000] "GET /page%d HTTP/1.1" 404 123`, i, i)
+		processLine(line)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !banned["10.99.99.99"] {
+		t.Error("burst detection should have banned 10.99.99.99 after 5 rapid 4xx requests")
+	}
+}
+
+func TestBurstDetectionBelowLimit(t *testing.T) {
+	// Reset global state
+	mu.Lock()
+	visitorCache = NewLRUCache(defaultMaxVisitors)
+	banned = make(map[string]bool)
+	whitelist = make(map[string]bool)
+	whitelist["127.0.0.1"] = true
+	mu.Unlock()
+
+	originalBurstLimit := conf.BurstLimit
+	originalBurstWindow := conf.BurstWindow
+	originalPreview := conf.PreviewMode
+	originalThreshold := conf.BanThreshold
+	conf.BurstLimit = 5
+	conf.BurstWindow = 3 * time.Second
+	conf.PreviewMode = true
+	conf.BanThreshold = 100.0 // Very high so score alone won't trigger
+	defer func() {
+		conf.BurstLimit = originalBurstLimit
+		conf.BurstWindow = originalBurstWindow
+		conf.PreviewMode = originalPreview
+		conf.BanThreshold = originalThreshold
+	}()
+
+	// Send only 4 requests (below burst limit of 5)
+	for i := 0; i < 4; i++ {
+		line := fmt.Sprintf(`10.88.88.88 - - [20/Feb/2026:10:00:0%d +0000] "GET /page%d HTTP/1.1" 404 123`, i, i)
+		processLine(line)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if banned["10.88.88.88"] {
+		t.Error("burst detection should NOT have banned 10.88.88.88 (only 4 requests, limit is 5)")
+	}
+}
+
+func TestBurstDetectionWindowExpiry(t *testing.T) {
+	// Reset global state
+	mu.Lock()
+	visitorCache = NewLRUCache(defaultMaxVisitors)
+	banned = make(map[string]bool)
+	whitelist = make(map[string]bool)
+	whitelist["127.0.0.1"] = true
+	mu.Unlock()
+
+	originalBurstLimit := conf.BurstLimit
+	originalBurstWindow := conf.BurstWindow
+	originalPreview := conf.PreviewMode
+	originalThreshold := conf.BanThreshold
+	conf.BurstLimit = 5
+	conf.BurstWindow = 50 * time.Millisecond // Very short window for testing
+	conf.PreviewMode = true
+	conf.BanThreshold = 100.0
+	defer func() {
+		conf.BurstLimit = originalBurstLimit
+		conf.BurstWindow = originalBurstWindow
+		conf.PreviewMode = originalPreview
+		conf.BanThreshold = originalThreshold
+	}()
+
+	// Send 3 requests, wait for window to expire, then send 3 more
+	for i := 0; i < 3; i++ {
+		line := fmt.Sprintf(`10.77.77.77 - - [20/Feb/2026:10:00:0%d +0000] "GET /page%d HTTP/1.1" 404 123`, i, i)
+		processLine(line)
+	}
+
+	// Wait longer than the burst window
+	time.Sleep(100 * time.Millisecond)
+
+	for i := 3; i < 6; i++ {
+		line := fmt.Sprintf(`10.77.77.77 - - [20/Feb/2026:10:00:0%d +0000] "GET /page%d HTTP/1.1" 404 123`, i, i)
+		processLine(line)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if banned["10.77.77.77"] {
+		t.Error("burst detection should NOT have banned 10.77.77.77 (requests spread across expired windows)")
+	}
+}
+
+func TestBurstDetectionDoesNotAffectWhitelisted(t *testing.T) {
+	// Reset global state
+	mu.Lock()
+	visitorCache = NewLRUCache(defaultMaxVisitors)
+	banned = make(map[string]bool)
+	whitelist = make(map[string]bool)
+	whitelist["127.0.0.1"] = true
+	whitelist["10.66.66.66"] = true // Whitelist the IP we'll test
+	mu.Unlock()
+
+	originalBurstLimit := conf.BurstLimit
+	originalBurstWindow := conf.BurstWindow
+	originalPreview := conf.PreviewMode
+	originalThreshold := conf.BanThreshold
+	conf.BurstLimit = 5
+	conf.BurstWindow = 3 * time.Second
+	conf.PreviewMode = true
+	conf.BanThreshold = 100.0
+	defer func() {
+		conf.BurstLimit = originalBurstLimit
+		conf.BurstWindow = originalBurstWindow
+		conf.PreviewMode = originalPreview
+		conf.BanThreshold = originalThreshold
+	}()
+
+	// Send 10 rapid requests from whitelisted IP
+	for i := 0; i < 10; i++ {
+		line := fmt.Sprintf(`10.66.66.66 - - [20/Feb/2026:10:00:0%d +0000] "GET /page%d HTTP/1.1" 404 123`, i, i)
+		processLine(line)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if banned["10.66.66.66"] {
+		t.Error("burst detection should NOT ban whitelisted IPs")
+	}
+}

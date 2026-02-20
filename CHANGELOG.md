@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-02-20
+
+### Added
+- **Burst detection** — instant ban when an IP sends ≥ `BURST_LIMIT` (default: 5) 4xx requests within `BURST_WINDOW` (default: 3s). Catches aggressive scanners that spray many low-score paths (e.g., `eval-stdin.php` enumeration) faster than score-based detection alone.
+- `BURST_LIMIT` environment variable (default: `5`) — max 4xx hits in burst window before instant ban. Set to `0` to disable burst detection.
+- `BURST_WINDOW` environment variable (default: `3s`) — sliding window duration for burst counting.
+- `TAIL_POLL_INTERVAL` environment variable (default: `100ms`) — configurable log file polling interval.
+- `HitTimes` field on `Visitor` struct for sliding window timestamp tracking.
+- **4 new tests** — `TestBurstDetection`, `TestBurstDetectionBelowLimit`, `TestBurstDetectionWindowExpiry`, `TestBurstDetectionDoesNotAffectWhitelisted`.
+
+### Changed
+- Log tail polling interval reduced from 500ms to 100ms (configurable) for 5× faster reaction to new log lines.
+- `processLine()` now checks burst threshold before score threshold — burst bans fire earlier in the pipeline.
+
+---
+
 ## [0.3.1] - 2026-02-16
 
 ### Added
