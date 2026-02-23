@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"container/list"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -31,7 +32,7 @@ import (
 const (
 	APP                          = "goLogScythe"
 	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.4.0"
+	VERSION                      = "0.4.1"
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
@@ -878,6 +879,14 @@ func calculateScore(urlPath string) float64 {
 }
 
 func main() {
+	versionFlag := flag.Bool("version", false, "Print version information and exit")
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("%s version %s\n", APP, VERSION)
+		return
+	}
+
 	fmt.Printf("🚀 🛡️ Starting App:'%s', ver:%s, Repo: %s\n", APP, VERSION, REPOSITORY)
 
 	if conf.PreviewMode {
