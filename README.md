@@ -210,37 +210,47 @@ Ensure your `/etc/nftables.conf` is set up to handle the `parasites` set:
 flush ruleset
 
 table inet filter {
-	# 1. Parasite Set for ipv4 (Used by  goLogScythe Tool)
+	# 1. Parasite Set for ipv4 (Used by goLogScythe Tool)
 	set parasites {
           type ipv4_addr
           flags interval
     }
-    # 1. Parasite Set for ipv6 (Used by  goLogScythe Tool)
+    # 1. Parasite Set for ipv6 (Used by goLogScythe Tool)
     set parasites6 {
         type ipv6_addr
         flags interval
     }
 	chain input {
 		type filter hook input priority 0; policy drop;
-		# 2. Early Drop: Block parasites before anything else
-	        ip saddr @parasites drop
-	        ip6 saddr @parasites6 drop
 
-        	# 3. Allow Loopback (essential)
-	        iif "lo" accept
+		# 1. Allow Essential Loopback Connectivity
+		iif "lo" accept
 
-		# 4. Allow essential IPv4 + IPv6 ICMP (after loopback, before established)
+		# 2. ⚠️⚠️ Trusted Infrastructure — add your own IPs here!
+		# Even if they are in the parasite list, they will be ACCEPTED here first.
+		tcp dport 22 ip saddr 192.168.50.7 accept comment "YOUR BASTION IP SSH"
+
+		# 3. The Ban Hammer — BEFORE ct state established so that even existing
+		#    HTTP keep-alive connections from banned IPs are killed instantly.
+		#    Rate-limited logging writes to kern.log with NFT_BAN prefix (max 6/min)
+		ip saddr @parasites limit rate 6/minute burst 3 packets log prefix "NFT_BAN " drop
+		ip saddr @parasites drop
+		ip6 saddr @parasites6 limit rate 6/minute burst 3 packets log prefix "NFT_BAN6 " drop
+		ip6 saddr @parasites6 drop
+
+		# 4. Allow Established (AFTER parasites — banned IPs can no longer
+		#    ride existing connections through ct state established)
+		ct state established,related accept
+
+		# 5. Allow essential IPv4 + IPv6 ICMP
 		ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
 		icmpv6 type { echo-request, echo-reply, packet-too-big, destination-unreachable, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
 
-        	# 5. Allow Established (Already connected traffic)
-	        ct state established,related accept
+		# 6. Allow HTTP/S public services (log audited by goLogScythe)
+		tcp dport { 80, 443 } accept comment "for Nginx HTTP/S"
 
-        	# 6. ⚠️⚠️ Double check to add your own rules here !
-	        tcp dport 22 ip saddr 192.168.50.7 accept comment "YOUR BASTION IP SSH"
-
-        	tcp dport { 80, 443 } accept comment "for Nginx HTTP/S"
-
+		# 7. Final Catch-all logging
+		limit rate 12/minute burst 5 packets log prefix "NFT_DROP " drop
 	}
 	chain forward {
 		type filter hook forward priority filter;
@@ -249,9 +259,31 @@ table inet filter {
 		type filter hook output priority filter;
 	}
 }
-
-
 ```
+
+#### 📐 Packet Flow Through nftables Rules
+
+The rule ordering is **critical** — dropping parasites *before* `ct state established` ensures that banned IPs cannot continue sending requests on existing HTTP keep-alive connections:
+
+```mermaid
+flowchart TD
+    A["📥 Incoming Packet"] --> B{"Loopback?"}
+    B -->|Yes| C["✅ Accept"]
+    B -->|No| D{"Trusted SSH/Infra?"}
+    D -->|Yes| C
+    D -->|No| E{"🚫 In @parasites set?"}
+    E -->|Yes| F["📝 Log NFT_BAN + Drop"]
+    E -->|No| G{"ct state established?"}
+    G -->|Yes| C
+    G -->|No| H{"ICMP?"}
+    H -->|Yes| C
+    H -->|No| I{"HTTP/S port 80,443?"}
+    I -->|Yes| C
+    I -->|No| J["📝 Log NFT_DROP + Drop"]
+```
+
+> [!IMPORTANT]
+> The `@parasites drop` rule **must** come before `ct state established,related accept`. Otherwise, a scanner that already has an open HTTP connection will continue to send requests even after being banned — the established connection would be accepted before reaching the drop rule.
 
 *Check syntax and apply with:*
 
