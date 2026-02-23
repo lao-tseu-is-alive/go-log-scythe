@@ -1,5 +1,12 @@
 #!/bin/bash
-VERSION="v0.4.0"
+VERSION="v0.4.1"
+echo "## will check if goLogScythe release ${VERSION} is already installed"
+if [ -f "/usr/local/bin/goLogScythe-linux-amd64" ]; then
+    if [ "$(/usr/local/bin/goLogScythe-linux-amd64 --version)" = "goLogScythe v${VERSION}" ]; then
+        echo "## goLogScythe release ${VERSION} is already installed, nothing to do !"
+        exit 0
+    fi
+fi
 echo "## will cd to deploy_goLogScythe directory if not found will exit"
 cd deploy_goLogScythe || { echo "💥 💥 directory : deploy_goLogScythe  not found, will exit"; exit 1; }
 TODAY=$(date -I)

@@ -883,7 +883,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Printf("%s version %s\n", APP, VERSION)
+		fmt.Printf("%s v%s\n", APP, VERSION)
 		return
 	}
 
