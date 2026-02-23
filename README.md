@@ -524,3 +524,12 @@ journalctl -u go-log-scythe -f
 Help us get rid of parasites! If you have a better regex for a specific web server, new threat patterns for `rules.conf`, or a performance tweak, feel free to open a PR.
 
 **LogScythe** — *Clean logs. Fast servers. No parasites.*
+
+---
+## 📄 License
+
+MIT License - see [LICENSE](LICENSE)
+
+---
+
+Built with ❤️ using Go
