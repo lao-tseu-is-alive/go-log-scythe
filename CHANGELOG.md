@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.2] - 2026-06-29
+
+### Added
+- **SIGHUP runtime reload** — The daemon now handles `syscall.SIGHUP` for zero-downtime configuration reload:
+  - Reloads threat detection rules from `rules.conf` (path from `RULES_PATH`).
+  - Reloads CIDR ranges from the nftables configuration file (path from `NFTABLES_CONF_PATH`) for pre-check skipping.
+- New `reloadConfiguration()` function with safe atomic swap of configuration.
+- `rulesMu` and `nftRangesMu` (`sync.RWMutex`) plus `getNftRanges()` helper for race-free concurrent access during reload.
+- Signal handler updated to a loop that treats `SIGHUP` as reload (without cancelling the context or stopping `tailLog`).
+- `loadRules()` now builds a fresh slice and swaps it under lock (prevents duplicate rules on reload and fixes latent append bug).
+- `calculateScore()` now takes a quick snapshot of rules under read lock.
+- `deploy/go-log-scythe.service` now includes `ExecReload=/bin/kill -s HUP $MAINPID`.
+
+### Changed
+- Startup nftables range loading uses a protected assignment.
+- All hot-path reads of `rules` and `nftRanges` (in `processLine` and `filterBannableIPs`) now use safe snapshots.
+
+### Fixed / Improved
+- True "set and forget" operation: no more hourly `systemctl restart` via cron required to pick up new rules or CIDR ranges.
+- Eliminates the repeated `⚠️  WARN: nft add element for X.X.X.X: exit status 1 (may already exist)` spam that happened on every restart inside `loadAndSyncBannedList`.
+- Log file offset, LRU visitor cache (scores, paths, burst windows), and in-kernel + in-memory ban state are fully preserved across reloads with no perceptible interruption of monitoring.
+
+---
+
 ## [0.4.1] - 2026-02-23
 
 ### Added

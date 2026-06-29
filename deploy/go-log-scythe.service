@@ -11,6 +11,9 @@ Group=root
 
 WorkingDirectory=/var/lib/go-log-scythe
 ExecStart=/usr/local/bin/goLogScythe-linux-amd64
+# Support runtime reload of rules.conf + nftables CIDR ranges without losing state.
+# Usage: systemctl reload go-log-scythe.service  (or: kill -HUP <pid>)
+ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
 RestartSec=5
 

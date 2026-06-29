@@ -32,7 +32,7 @@ import (
 const (
 	APP                          = "goLogScythe"
 	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.4.1"
+	VERSION                      = "0.4.2"
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
@@ -202,6 +202,11 @@ var (
 	mu           sync.Mutex   // Protects banned and whitelist maps
 	nftRanges    []*net.IPNet // Loaded nftables CIDR ranges for pre-check
 
+	// rulesMu and nftRangesMu protect the respective globals for safe concurrent
+	// reload on SIGHUP without interrupting the tailLog monitoring loop.
+	rulesMu     sync.RWMutex
+	nftRangesMu sync.RWMutex
+
 	reLog      *regexp.Regexp
 	reOverride *regexp.Regexp
 	rules      []Rule // Loaded threat detection rules
@@ -346,9 +351,10 @@ func processLine(line string) {
 		return
 	}
 
-	// Skip IPs already covered by a broad nftables CIDR range
+	// Skip IPs already covered by a broad nftables CIDR range.
+	// Snapshot under lock to be race-free with SIGHUP reload of nftRanges.
 	parsedIP := net.ParseIP(ip)
-	if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
+	if matchingRange := isIPCoveredByRanges(parsedIP, getNftRanges()); matchingRange != nil {
 		log.Printf(warnIpInExcludedRange, ip, 0.0, matchingRange.String())
 		return
 	}
@@ -515,7 +521,7 @@ func filterBannableIPs(ipScores map[string]float64) []ipStat {
 		if whitelist[ip] || banned[ip] {
 			continue
 		}
-		if matchingRange := isIPCoveredByRanges(net.ParseIP(ip), nftRanges); matchingRange != nil {
+		if matchingRange := isIPCoveredByRanges(net.ParseIP(ip), getNftRanges()); matchingRange != nil {
 			log.Printf(warnIpInExcludedRange,
 				ip, score, matchingRange.String())
 			continue
@@ -680,6 +686,15 @@ func isIPCoveredByRanges(ip net.IP, ranges []*net.IPNet) *net.IPNet {
 	return nil
 }
 
+// getNftRanges returns a snapshot of the current nftRanges under read lock.
+// This allows safe concurrent reload of CIDR ranges via SIGHUP while
+// processLine and filterBannableIPs continue to run without interruption.
+func getNftRanges() []*net.IPNet {
+	nftRangesMu.RLock()
+	defer nftRangesMu.RUnlock()
+	return nftRanges
+}
+
 // syncIPToNftSet adds an IP to the appropriate nftables set (IPv4 or IPv6).
 func syncIPToNftSet(normalized string, parsedIP net.IP) {
 	setName := conf.NftSetName
@@ -794,7 +809,10 @@ func getEnvFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
-// loadRules parses the rules configuration file and populates the rules slice
+// loadRules parses the rules configuration file and populates the rules slice.
+// It builds a fresh slice then swaps it under rulesMu so that SIGHUP reload
+// is safe and does not lose previous rules on transient read errors.
+// The append-to-global bug is eliminated: we never append to the live slice.
 func loadRules(path string) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -805,7 +823,7 @@ func loadRules(path string) {
 
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
-	loadedCount := 0
+	var loaded []Rule
 
 	for scanner.Scan() {
 		lineNum++
@@ -848,11 +866,14 @@ func loadRules(path string) {
 			log.Printf("⚠️  WARN: Rule at line %d has score %.1f exceeding cap %.1f (will be clamped)", lineNum, score, maxScorePerHit)
 		}
 
-		rules = append(rules, Rule{Score: score, Pattern: re, Raw: pattern})
-		loadedCount++
+		loaded = append(loaded, Rule{Score: score, Pattern: re, Raw: pattern})
 	}
 
-	log.Printf("📋 Loaded %d threat detection rules from %s", loadedCount, path)
+	rulesMu.Lock()
+	rules = loaded
+	rulesMu.Unlock()
+
+	log.Printf("📋 Loaded %d threat detection rules from %s", len(loaded), path)
 }
 
 // calculateScore determines the score for a given URL path based on loaded rules.
@@ -865,7 +886,11 @@ func calculateScore(urlPath string) float64 {
 		return VerySuspiciousBinProbesScore // Critical: binary protocol probe detected
 	}
 
-	for _, rule := range rules {
+	rulesMu.RLock()
+	rs := rules
+	rulesMu.RUnlock()
+
+	for _, rule := range rs {
 		if rule.Pattern.MatchString(urlPath) {
 			// Clamp score to prevent single-hit instant bans from misconfigured rules
 			if rule.Score > maxScorePerHit {
@@ -876,6 +901,42 @@ func calculateScore(urlPath string) float64 {
 	}
 	// Default score for unmatched paths
 	return 1.0
+}
+
+// reloadConfiguration reloads rules.conf and nftables CIDR ranges from disk.
+// It is intended to be called on SIGHUP.
+// It deliberately does NOT:
+//   - touch visitorCache (accumulated scores)
+//   - touch banned map or re-add to nftables (avoids spurious "already exist" warnings)
+//   - cancel the context or restart tailLog (monitoring continues seamlessly)
+func reloadConfiguration() {
+	log.Println("📋 Rechargement de la configuration via SIGHUP...")
+
+	// Reload threat detection rules using the path configured at start (RULES_PATH).
+	if conf.RulesPath != "" {
+		loadRules(conf.RulesPath)
+	} else {
+		rulesMu.Lock()
+		rules = nil
+		rulesMu.Unlock()
+	}
+
+	// Reload CIDR ranges used only for pre-checks (skip individual ban of IPs
+	// already covered by broad ranges in /etc/nftables.conf).
+	// Note: this does NOT reload the kernel nftables ruleset itself.
+	newRanges, err := loadNftablesRanges(conf.NftablesConfPath)
+	if err != nil {
+		log.Printf("⚠️  WARN: Cannot reload nftables config '%s': %v (keeping previous ranges)", conf.NftablesConfPath, err)
+	} else {
+		nftRangesMu.Lock()
+		nftRanges = newRanges
+		nftRangesMu.Unlock()
+		if len(newRanges) > 0 {
+			log.Printf("📋 Reloaded %d CIDR ranges from %s", len(newRanges), conf.NftablesConfPath)
+		}
+	}
+
+	log.Printf("📋 Configuration rechargée via SIGHUP (rules + CIDRs)")
 }
 
 func main() {
@@ -905,30 +966,44 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // ← Ensures cleanup when main() exits naturally.
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
+	// Signal handler: SIGHUP triggers config reload without interrupting tailLog.
+	// INT/TERM trigger graceful shutdown as before.
 	go func() {
-		sig := <-sigChan
-		log.Printf("\n🛑 Received %v, shutting down gracefully...", sig)
-		cancel()
+		for {
+			sig := <-sigChan
+			if sig == syscall.SIGHUP {
+				reloadConfiguration()
+				continue
+			}
+			log.Printf("\n🛑 Received %v, shutting down gracefully...", sig)
+			cancel()
+			return
+		}
 	}()
 
 	// 1. Safety Phase
 	loadSafetyWhitelist()
 
-	// 2. Load nftables CIDR ranges (always, even in preview — for informational warnings)
+	// 2. Load nftables CIDR ranges (always, even in preview — for informational warnings).
+	// Protected by nftRangesMu so that later SIGHUP reloads are race-free.
 	var err error
-	nftRanges, err = loadNftablesRanges(conf.NftablesConfPath)
+	initialRanges, err := loadNftablesRanges(conf.NftablesConfPath)
 	if err != nil {
 		log.Printf("⚠️  WARN: Cannot read nftables config '%s': %v (skipping range check)", conf.NftablesConfPath, err)
+	} else {
+		nftRangesMu.Lock()
+		nftRanges = initialRanges
+		nftRangesMu.Unlock()
 	}
-	if len(nftRanges) > 0 {
-		log.Printf("📋 Loaded %d CIDR ranges from %s", len(nftRanges), conf.NftablesConfPath)
+	if len(initialRanges) > 0 {
+		log.Printf("📋 Loaded %d CIDR ranges from %s", len(initialRanges), conf.NftablesConfPath)
 	}
 
 	// 3. Sync Phase (Skip kernel sync if in preview)
 	if !conf.PreviewMode {
-		loadAndSyncBannedList(nftRanges)
+		loadAndSyncBannedList(initialRanges)
 	}
 
 	// 3. Scan All Mode - process entire log file first

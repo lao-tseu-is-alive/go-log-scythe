@@ -30,6 +30,7 @@ Unlike legacy tools or shell scripts, **LogScythe** uses lookup tables, meaning 
 * **Custom Log Format Support:** Override the default regex via `REGEX_OVERRIDE` to parse JSON, syslog, or any custom log format.
 * **Nftables Range Pre-Check:** Automatically detects IPs already covered by broad CIDR ranges in your `nftables.conf`, skipping redundant kernel commands and warning about potential nftables service issues (v0.3.1+).
 * **Burst Detection:** Instant ban when an IP sends too many 4xx requests within a short window — catches aggressive scanners spraying low-score paths before cumulative scoring kicks in (v0.4.0+).
+* **Runtime Configuration Reload:** Send `SIGHUP` (or `systemctl reload`) to hot-reload `rules.conf` and nftables CIDR ranges at runtime. Log offset, LRU visitor scores/burst state, and existing bans are fully preserved — no perceptible interruption (v0.4.2+).
 * **Persistence:** Bans survive reboots via a local state file and automatic kernel re-synchronization.
 * **Preview Mode:** Test your configuration against live logs without actually triggering firewall actions.
 * **Environment Driven:** Fully configurable via `.env` or system environment variables.
@@ -360,13 +361,13 @@ sudo PREVIEW_MODE=true SCAN_ALL_MODE=true ./goLogScythe
 | `LOG_PATH` | `/var/log/nginx/access.log` | Path to the web log file to monitor |
 | `WHITE_LIST_PATH` | `./whitelist.txt` | File containing IPs/CIDRs that should never be banned |
 | `BANNED_FILE_PATH` | `./banned_ips.txt` | Persistence file for banned IPs |
-| `RULES_PATH` | `""` | Path to `rules.conf` for weighted scoring (empty = backward compatible) |
+| `RULES_PATH` | `""` | Path to `rules.conf` for weighted scoring (empty = backward compatible). Reloaded on SIGHUP (v0.4.2+). |
 | `BAN_THRESHOLD` | `10.0` | **Score** threshold before a ban is issued |
 | `REPEAT_PENALTY` | `0.1` | Score multiplier for repeat requests to same path (10% = less spam score) |
 | `BAN_WINDOW` | `15m` | Sliding window duration for score tracking |
 | `NFT_SET_NAME` | `parasites` | The name of the nftables set for IPv4 |
 | `NFT_SET_NAME_V6` | `parasites6` | The name of the nftables set for IPv6 |
-| `NFTABLES_CONF_PATH` | `/etc/nftables.conf` | Path to nftables config for CIDR range pre-check (v0.3.1+) |
+| `NFTABLES_CONF_PATH` | `/etc/nftables.conf` | Path to nftables config for CIDR range pre-check. Reloaded on SIGHUP (v0.4.2+). |
 | `CACHE_CAPACITY` | `10000` | Maximum number of visitor IPs tracked simultaneously (v0.3.0+) |
 | `BURST_LIMIT` | `5` | Max 4xx hits in burst window before instant ban; set to `0` to disable (v0.4.0+) |
 | `BURST_WINDOW` | `3s` | Sliding window duration for burst counting (v0.4.0+) |
@@ -477,6 +478,8 @@ Type=simple
 User=root
 WorkingDirectory=/var/lib/go-log-scythe
 ExecStart=/usr/local/bin/goLogScythe-linux-amd64
+# Runtime reload support (rules + CIDR ranges) without losing monitoring state
+ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
 RestartSec=5
 
@@ -496,8 +499,33 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl enable --now go-log-scythe
-
 ```
+
+#### Runtime Reload (SIGHUP)
+
+GoLogScythe supports **hot reloading** of configuration:
+
+```bash
+# Preferred (once the unit file has ExecReload)
+sudo systemctl reload go-log-scythe
+
+# Alternative
+sudo kill -HUP $(systemctl show -p MainPID --value go-log-scythe)
+```
+
+On SIGHUP the daemon will:
+- Reload `rules.conf` (weighted threat scoring)
+- Reload CIDR ranges from your nftables config (for pre-check skipping)
+- Log something like: `📋 Configuration rechargée via SIGHUP (rules + CIDRs)`
+
+**What is preserved** (no restart needed):
+- Current position in the log file (monitoring continues seamlessly)
+- LRU visitor cache (accumulated scores, distinct paths, burst windows)
+- Already-banned IPs (both in-memory map and kernel nftables sets)
+
+This removes the need for periodic forced restarts (e.g. hourly cron jobs) and eliminates the noisy "nft add element may already exist" warnings on every restart.
+
+> **Note:** `systemctl reload` only updates the Go daemon's view. If you also changed `/etc/nftables.conf` elements, you still need to apply them with `sudo nft -f /etc/nftables.conf` (or `systemctl reload nftables`).
 
 ---
 
