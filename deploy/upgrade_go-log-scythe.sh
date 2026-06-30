@@ -1,13 +1,13 @@
 #!/bin/bash
 VERSION="0.4.2"
 cd /root/
-if [ -f "goLogScythe-linux-amd64.tar.gz" ]; then
+if [[ -f "goLogScythe-linux-amd64.tar.gz" ]]; then
     echo "## will remove old goLogScythe-linux-amd64.tar.gz"
     rm goLogScythe-linux-amd64.tar.gz
 fi
 echo "## will check if goLogScythe release ${VERSION} is already installed"
-if [ -f "/usr/local/bin/goLogScythe-linux-amd64" ]; then
-    if [ "$(/usr/local/bin/goLogScythe-linux-amd64 --version)" = "goLogScythe v${VERSION}" ]; then
+if [[ -f "/usr/local/bin/goLogScythe-linux-amd64" ]]; then
+    if [[ $(/usr/local/bin/goLogScythe-linux-amd64 --version) == "goLogScythe v${VERSION}" ]]; then
         echo "## goLogScythe release ${VERSION} is already installed, nothing to do !"
         exit 0
     fi
