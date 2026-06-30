@@ -7,979 +7,156 @@ and a safety-first preview mode.
 package main
 
 import (
-	"bufio"
-	"container/list"
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"regexp"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
-	"time"
+
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/cache"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/config"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/firewall"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/monitor"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/parser"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/safety"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/scoring"
 )
 
-// --- Default Constants ---
 const (
-	APP                          = "goLogScythe"
-	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.4.4"
-	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
-	defaultLogPath               = "/var/log/nginx/access.log"
-	defaultWhitelistPath         = "./whitelist.txt"
-	defaultBannedPath            = "banned_ips.txt"
-	defaultRulesPath             = ""   // Empty means no rules file (backward compatible)
-	defaultThreshold             = 10.0 // Score threshold for banning
-	defaultRepeatPenalty         = 0.1  // 10% of full score for repeat path hits
-	defaultWindow                = 15 * time.Minute
-	defaultNftSet                = "parasites"
-	defaultNftSetV6              = "parasites6"
-	defaultNftConf               = "nftables.conf"
-	defaultMaxVisitors           = 10000                  // Maximum visitors to track before eviction
-	defaultBurstLimit            = 5                      // Max 4xx hits in burst window before instant ban
-	defaultBurstWindow           = 3 * time.Second        // Sliding window for burst counting
-	defaultTailPollInterval      = 100 * time.Millisecond // Poll interval for tail -f style monitoring
-	VerySuspiciousBinProbesScore = 12.666
-	defaultNftPath               = "/usr/sbin/nft"
-	defaultUfwPath               = "/usr/sbin/ufw"
-	maxScorePerHit               = 20.0 // Maximum score any single hit can contribute
-	maxPatternLength             = 512  // Maximum regex pattern length in rules.conf
-	// Combined Log Format Regex (works for both Nginx and Apache)
-	// Uses (?s) to handle binary garbage/newlines in malformed requests
-	// Matches: 1.2.3.4 - - [Date] \"METHOD /path HTTP/x.x\" 404 ...
-	// OR malformed: 1.2.3.4 - - [Date] \"<binary garbage>\" 400 ...
-	// Group 1: IP, Group 2: URL path (may be empty for malformed), Group 3: Status code
-	// Two-stage: try to extract path, fallback to just IP/status for binary probes
-	defaultLogRegex       = `(?s)^(\S+)\s+-\s+-\s+\[.*?\]\s+"(?:\S+\s+(\S*)\s+.*?|.*?)"\s+(\d{3})`
-	warnIpInExcludedRange = "⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — if traffic from this IP reached the server, verify that nftables service is running"
-	msgFuncNReturnedError = "%v returned error: %v"
+	APP        = "goLogScythe"
+	VERSION    = "0.5.0"
+	REPOSITORY = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 )
 
-var defaultNftablesConfPath = filepath.Join("/etc/", defaultNftConf)
+// warnIpInExcludedRange is the message logged when we skip an IP because
+// it is already covered by a broad nftables range.
+const warnIpInExcludedRange = "⚠️  WARN: IP %s (score: %.1f) is already covered by nftables range %s — if traffic from this IP reached the server, verify that nftables service is running"
 
-// Rule represents a threat detection rule with a score and regex pattern
-type Rule struct {
-	Score   float64
-	Pattern *regexp.Regexp
-	Raw     string // Original pattern string for logging
-}
-
-type Config struct {
-	LogPath          string
-	WhitelistPath    string
-	BannedPath       string
-	RulesPath        string  // Path to rules.conf file
-	NftablesConfPath string  // Path to nftables.conf for CIDR range checking
-	BanThreshold     float64 // Score threshold for banning (default: 10.0)
-	RepeatPenalty    float64 // Score multiplier for repeat path hits (default: 0.1)
-	Window           time.Duration
-	NftSetName       string
-	NftSetNameV6     string
-	RegexOverride    string
-	BurstLimit       int           // Max 4xx hits in burst window before instant ban (default: 5)
-	BurstWindow      time.Duration // Sliding window for burst counting (default: 3s)
-	TailPollInterval time.Duration // Poll interval for tail -f style monitoring (default: 100ms)
-	PreviewMode      bool
-	ScanAllMode      bool
-}
-
-type Visitor struct {
-	IP       string
-	Score    float64         // Cumulative danger score
-	Paths    map[string]bool // Track distinct paths for repeat penalty
-	HitTimes []time.Time     // Sliding window of recent 4xx hit timestamps for burst detection
-	LastSeen time.Time
-}
-
-// LRUCache is a thread-safe bounded cache with LRU eviction policy.
-// It uses an internal RWMutex: reads (Get) use RLock, writes (Put/Delete/CleanExpired) use full Lock.
-type LRUCache struct {
-	mu       sync.RWMutex
-	capacity int
-	items    map[string]*list.Element
-	order    *list.List // Front = most recently used
-}
-
-// NewLRUCache creates a new LRU cache with the given capacity
-func NewLRUCache(capacity int) *LRUCache {
-	return &LRUCache{
-		capacity: capacity,
-		items:    make(map[string]*list.Element),
-		order:    list.New(),
-	}
-}
-
-// Get retrieves a visitor from the cache and marks it as recently used.
-// Note: MoveToFront is a write operation on the list, so we use a full Lock here.
-func (c *LRUCache) Get(ip string) (*Visitor, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if elem, ok := c.items[ip]; ok {
-		c.order.MoveToFront(elem)
-		return elem.Value.(*Visitor), true
-	}
-	return nil, false
-}
-
-// Put adds or updates a visitor in the cache
-func (c *LRUCache) Put(ip string, visitor *Visitor) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if elem, ok := c.items[ip]; ok {
-		c.order.MoveToFront(elem)
-		elem.Value = visitor
-		return
-	}
-
-	// Evict oldest if at capacity
-	if c.order.Len() >= c.capacity {
-		c.evictOldest()
-	}
-
-	elem := c.order.PushFront(visitor)
-	c.items[ip] = elem
-}
-
-// Delete removes a visitor from the cache
-func (c *LRUCache) Delete(ip string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if elem, ok := c.items[ip]; ok {
-		c.order.Remove(elem)
-		delete(c.items, ip)
-	}
-}
-
-// evictOldest removes the least recently used item
-func (c *LRUCache) evictOldest() {
-	if elem := c.order.Back(); elem != nil {
-		visitor := elem.Value.(*Visitor)
-		c.order.Remove(elem)
-		delete(c.items, visitor.IP)
-	}
-}
-
-// Len returns the number of items in the cache
-func (c *LRUCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.order.Len()
-}
-
-// CleanExpired removes entries older than the given window
-func (c *LRUCache) CleanExpired(window time.Duration) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	removed := 0
-	now := time.Now()
-
-	// Iterate from back (oldest) to front
-	for elem := c.order.Back(); elem != nil; {
-		visitor := elem.Value.(*Visitor)
-		prev := elem.Prev()
-		if now.Sub(visitor.LastSeen) > window {
-			c.order.Remove(elem)
-			delete(c.items, visitor.IP)
-			removed++
-		}
-		elem = prev
-	}
-	return removed
-}
-
+// The heavy lifting now lives in internal/monitor.
+// We keep minimal globals only for the (large) existing integration test file during transition.
 var (
-	conf         Config
-	visitorCache *LRUCache
+	conf         config.Config
+	visitorCache *cache.LRUCache
 	banned       = make(map[string]bool)
 	whitelist    = make(map[string]bool)
-	mu           sync.Mutex   // Protects banned and whitelist maps
-	nftRanges    []*net.IPNet // Loaded nftables CIDR ranges for pre-check
-
-	// rulesMu and nftRangesMu protect the respective globals for safe concurrent
-	// reload on SIGHUP without interrupting the tailLog monitoring loop.
-	rulesMu     sync.RWMutex
-	nftRangesMu sync.RWMutex
-
-	// nftPath and ufwPath are resolved absolute paths to the external binaries.
-	// They are populated in init() from NFT_PATH / UFW_PATH (or secure defaults).
-	// Using absolute paths avoids relying on PATH lookup (addresses go:S4036).
-	nftPath string
-	ufwPath string
-
-	reLog      *regexp.Regexp
-	reOverride *regexp.Regexp
-	rules      []Rule // Loaded threat detection rules
+	mu           sync.Mutex
+	nftRanges    []*net.IPNet
+	rulesMu      sync.RWMutex
+	nftRangesMu  sync.RWMutex
+	nftPath      string
+	ufwPath      string
+	reLog        *regexp.Regexp
+	reOverride   *regexp.Regexp
+	rules        []scoring.Rule
 )
 
-// nftDuplicateMessages lists the substrings that nft reports when an element
-// is already present in a set. These cases are treated as success (idempotent).
-var nftDuplicateMessages = []string{
-	"File exists",
-	"already exists",
+// theGlobalMonitor is used by compatibility shims for the integration test file.
+// Clean code uses monitor.New(...) directly.
+var theGlobalMonitor = monitor.New(config.Load())
+
+//func NewLRUCache(cap int) *cache.LRUCache {return cache.NewLRUCache(cap)}
+
+func calculateScore(p string) float64 {
+	return scoring.Calculate(p)
 }
 
-func init() {
-	// Initialize configuration from Environment Variables
-	conf = Config{
-		LogPath:          getEnv("LOG_PATH", defaultLogPath),
-		WhitelistPath:    getEnv("WHITE_LIST_PATH", defaultWhitelistPath),
-		BannedPath:       getEnv("BANNED_FILE_PATH", defaultBannedPath),
-		RulesPath:        getEnv("RULES_PATH", defaultRulesPath),
-		BanThreshold:     getEnvFloat("BAN_THRESHOLD", defaultThreshold),
-		RepeatPenalty:    getEnvFloat("REPEAT_PENALTY", defaultRepeatPenalty),
-		Window:           getEnvDuration("BAN_WINDOW", defaultWindow),
-		NftSetName:       getEnv("NFT_SET_NAME", defaultNftSet),
-		NftSetNameV6:     getEnv("NFT_SET_NAME_V6", defaultNftSetV6),
-		NftablesConfPath: getEnv("NFTABLES_CONF_PATH", defaultNftablesConfPath),
-		RegexOverride:    os.Getenv("REGEX_OVERRIDE"),
-		BurstLimit:       getEnvInt("BURST_LIMIT", defaultBurstLimit),
-		BurstWindow:      getEnvDuration("BURST_WINDOW", defaultBurstWindow),
-		TailPollInterval: getEnvDuration("TAIL_POLL_INTERVAL", defaultTailPollInterval),
-		PreviewMode:      getEnvBool("PREVIEW_MODE", false),
-		ScanAllMode:      getEnvBool("SCAN_ALL_MODE", false),
-	}
+var VerySuspiciousBinProbesScore = config.VerySuspiciousBinProbesScore
 
-	// Resolve absolute paths for external tools (never rely on $PATH)
-	nftPath = getEnv("NFT_PATH", defaultNftPath)
-	ufwPath = getEnv("UFW_PATH", defaultUfwPath)
+const (
+	defaultBannedPath = config.DefaultBannedPath
+	maxScorePerHit    = config.MaxScorePerHit
+	maxPatternLength  = config.MaxPatternLength
+	defaultLogRegex   = config.DefaultLogRegex
+	defaultNftConf    = config.DefaultNftConf
+)
 
-	// Pre-compile Regex
-	reLog = regexp.MustCompile(defaultLogRegex)
-
-	if conf.RegexOverride != "" {
-		var err error
-		reOverride, err = regexp.Compile(conf.RegexOverride)
-		if err != nil {
-			log.Fatalf("❌ FATAL: REGEX_OVERRIDE is invalid: %v", err)
-		}
-	}
-
-	// Load threat detection rules if configured
-	if conf.RulesPath != "" {
-		loadRules(conf.RulesPath)
-	}
-
-	// Initialize LRU cache for visitor tracking (capacity configurable via env)
-	cacheCapacity := getEnvInt("CACHE_CAPACITY", defaultMaxVisitors)
-	if cacheCapacity <= 0 {
-		cacheCapacity = defaultMaxVisitors
-	}
-	visitorCache = NewLRUCache(cacheCapacity)
+func loadSafetyWhitelist() {
+	safety.Load(conf.WhitelistPath, ufwPath)
+	mu.Lock()
+	whitelist = make(map[string]bool)
+	safety.Populate(whitelist)
+	mu.Unlock()
 }
 
-// tailLog monitors the log file for new lines and processes them.
-// Note on log rotation: This detects truncation-based rotation (copytruncate),
-// which is the most common method for nginx/logrotate. Rename-style rotation
-// (mv + create) is NOT detected and would require fsnotify (external dep).
-func tailLog(ctx context.Context, path string) {
-	file, err := os.Open(path)
-	if err != nil {
-		log.Fatalf("❌ FATAL: Cannot open log: %v", err)
-	}
-	defer file.Close()
+func normalizeIP(s string) string { return parser.NormalizeIP(s) }
 
-	// Start at the end of the file
-	offset, _ := file.Seek(0, io.SeekEnd)
-	reader := bufio.NewReader(file)
-
-	fmt.Printf("📖 Monitoring %s from offset %d...\n", path, offset)
-
-	for {
-		// Check for shutdown
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				// Wait for new data
-				time.Sleep(conf.TailPollInterval)
-
-				// Check for truncation (log rotation)
-				stats, _ := file.Stat()
-				if stats.Size() < offset {
-					fmt.Println("🔄 Log rotation detected. Resetting pointer.")
-					file.Seek(0, io.SeekStart)
-					offset = 0
-					reader.Reset(file)
-				}
-				continue
-			}
-			log.Printf("⚠️  Read error: %v", err)
-			break
-		}
-
-		offset += int64(len(line))
-		processLine(strings.TrimSpace(line))
-	}
+func tryMatchWithPath(re *regexp.Regexp, line string) (string, string, string, bool) {
+	return parser.TryMatchWithPath(re, line)
 }
 
-// matchLogLine tries override regex first, then the default log regex.
-// Returns the parsed IP, URL path, status code, and whether matching succeeded.
-func matchLogLine(line string) (ip, urlPath, status string, ok bool) {
-	if reOverride != nil {
-		ip, urlPath, status, ok = tryMatchWithPath(reOverride, line)
-		if ok && !isValidIP(ip) {
-			log.Fatalf("❌ FATAL: REGEX_OVERRIDE extracted invalid IP: %s", ip)
-		}
-	}
-	if !ok {
-		ip, urlPath, status, ok = tryMatchWithPath(reLog, line)
-	}
-	if !ok || !isValidIP(ip) {
-		return "", "", "", false
-	}
-	return ip, urlPath, status, true
+// The large Monitor implementation now lives in internal/monitor.
+// The shims below exist only to keep the (large) existing integration test file working
+// without a full rewrite in one step. New code and most unit tests should use monitor.New()
+// and its exported methods directly.
+
+func loadAndSyncBannedList(r []*net.IPNet) {
+	theGlobalMonitor.SetConfForTest(conf)
+
+	// Only clear banned (preserve whitelist/rules/ranges set up by other test setup).
+	theGlobalMonitor.ClearBannedForTest()
+
+	theGlobalMonitor.LoadAndSyncBannedList(r)
+
+	mu.Lock()
+	banned = make(map[string]bool)
+	theGlobalMonitor.SyncBannedToGlobalForTest(banned)
+	mu.Unlock()
+}
+
+func scanFullLog(p string) { theGlobalMonitor.ScanFullLog(p) }
+
+func loadRules(p string) {
+	theGlobalMonitor.LoadRules(p)
+	// sync via scoring global (rules are owned by scoring pkg after Load) + monitor copy
+	rulesMu.Lock()
+	rules = scoring.GetRules()
+	rulesMu.Unlock()
 }
 
 func processLine(line string) {
-	if line == "" {
-		return
+	theGlobalMonitor.SetConfForTest(conf)
+
+	// For tests that mutate the legacy global whitelist directly
+	theGlobalMonitor.SetWhitelistForTest(nil)
+	wlCopy := make(map[string]bool)
+	for k, v := range whitelist {
+		wlCopy[k] = v
 	}
+	theGlobalMonitor.SetWhitelistForTest(wlCopy)
 
-	ip, urlPath, status, ok := matchLogLine(line)
-	if !ok {
-		log.Printf("⚠️  WARN: Skipping unparseable line: %s", strings.TrimSpace(line))
-		return
-	}
+	theGlobalMonitor.ProcessLine(line)
 
-	// Normalize IP to canonical form (handles IPv6 representation variants)
-	ip = normalizeIP(ip)
-
-	// Check for 4xx status codes
-	if !strings.HasPrefix(status, "4") {
-		return
-	}
-
+	// Sync banned back for tests that inspect the package-level banned map.
 	mu.Lock()
-	defer mu.Unlock()
-
-	if whitelist[ip] || banned[ip] {
-		return
-	}
-
-	// Skip IPs already covered by a broad nftables CIDR range.
-	// Snapshot under lock to be race-free with SIGHUP reload of nftRanges.
-	parsedIP := net.ParseIP(ip)
-	if matchingRange := isIPCoveredByRanges(parsedIP, getNftRanges()); matchingRange != nil {
-		log.Printf(warnIpInExcludedRange, ip, 0.0, matchingRange.String())
-		return
-	}
-
-	// Calculate score for this path (clamped to maxScorePerHit)
-	pathScore := calculateScore(urlPath)
-	if pathScore == VerySuspiciousBinProbesScore {
-		log.Printf("⚠️ %s made a very suspicious ip request in log line: %s", ip, strings.TrimSpace(line))
-	}
-
-	// Use LRU cache for visitor tracking (auto-evicts oldest when full)
-	// Cache has its own internal lock, but we already hold mu for banned/whitelist
-	v, exists := visitorCache.Get(ip)
-	if !exists {
-		v = &Visitor{IP: ip, Paths: make(map[string]bool)}
-	}
-
-	// Apply repeat penalty if this path was already seen
-	if v.Paths[urlPath] {
-		pathScore *= conf.RepeatPenalty
-	} else {
-		v.Paths[urlPath] = true
-	}
-
-	v.Score += pathScore
-	now := time.Now()
-	v.LastSeen = now
-
-	// Burst detection: track 4xx hit timestamps in a sliding window
-	if conf.BurstLimit > 0 && conf.BurstWindow > 0 {
-		v.HitTimes = append(v.HitTimes, now)
-		// Trim hit times outside the burst window
-		cutoff := now.Add(-conf.BurstWindow)
-		trimIdx := 0
-		for trimIdx < len(v.HitTimes) && v.HitTimes[trimIdx].Before(cutoff) {
-			trimIdx++
-		}
-		if trimIdx > 0 {
-			v.HitTimes = v.HitTimes[trimIdx:]
-		}
-		// Check burst threshold
-		if len(v.HitTimes) >= conf.BurstLimit {
-			log.Printf("⚡ BURST: %s sent %d 4xx requests in %v — triggering instant ban",
-				ip, len(v.HitTimes), conf.BurstWindow)
-			visitorCache.Put(ip, v)
-			executeBan(ip, v.Score)
-			visitorCache.Delete(ip)
-			return
-		}
-	}
-
-	visitorCache.Put(ip, v)
-
-	if v.Score >= conf.BanThreshold {
-		executeBan(ip, v.Score)
-		visitorCache.Delete(ip)
-	}
+	theGlobalMonitor.SyncBannedToGlobalForTest(banned)
+	mu.Unlock()
 }
 
-func executeBan(ip string, score float64) {
-	if conf.PreviewMode {
-		log.Printf("👀 [PREVIEW] Would ban IP: %s (score: %.1f)", ip, score)
-		banned[ip] = true // Mark as banned in memory for this session
-		return
-	}
-
-	// Determine if IPv4 or IPv6 (ip is already normalized by processLine/scanFullLog)
-	parsedIP := net.ParseIP(ip)
-	setName := conf.NftSetName
-	if parsedIP != nil && parsedIP.To4() == nil {
-		// IPv6 address
-		setName = conf.NftSetNameV6
-	}
-
-	// 1. Kernel Action (idempotent)
-	ok, _, err := addIPToNFTSet(ip, setName)
-	if err != nil {
-		log.Printf("❌ ERROR: Failed to ban %s in nftables set %s: %v", ip, setName, err)
-		return
-	}
-	if !ok {
-		return
-	}
-
-	// 2. Persistence Action
-	banned[ip] = true
-	f, err := os.OpenFile(conf.BannedPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		defer f.Close()
-		if _, err := f.WriteString(ip + "\n"); err != nil {
-			log.Printf("⚠️  WARN: Failed to persist ban for %s: %v", ip, err)
-		}
-	}
-
-	log.Printf("🚫 BANNED: %s (set: %s)", ip, setName)
-}
-
-// addIPToNFTSet tries to add an IP to an nftables set in an idempotent way.
-// It returns:
-//
-//	ok        = true if the element is now present in the set (newly added or was already there)
-//	duplicate = true if it was already present (the call was effectively a no-op)
-//	err       = non-nil only for real failures
-func addIPToNFTSet(ip string, setName string) (ok, duplicate bool, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, nftPath, "add", "element", "inet", "filter", setName, "{", ip, "}")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		outStr := strings.TrimSpace(string(output))
-		for _, msg := range nftDuplicateMessages {
-			if strings.Contains(outStr, msg) {
-				return true, true, nil
-			}
-		}
-		return false, false, fmt.Errorf("nft add element %s to %s: %w: %s", ip, setName, err, outStr)
-	}
-	return true, false, nil
-}
-
-// ipStat holds an IP address and its cumulative threat score for scan results.
-type ipStat struct {
-	ip    string
-	score float64
-}
-
-// scanStats holds aggregate statistics from scanning a log file.
-type scanStats struct {
-	totalLines int
-	parsedOK   int
-	total4xx   int
-	ipScores   map[string]float64
-}
-
-// scanLogScores reads all lines from the file, parses them, and accumulates per-IP threat scores.
-func scanLogScores(file *os.File) scanStats {
-	stats := scanStats{ipScores: make(map[string]float64)}
-	ipPaths := make(map[string]map[string]bool) // IP -> paths seen (for repeat penalty)
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		stats.totalLines++
-
-		ip, urlPath, status, ok := matchLogLine(line)
-		if !ok {
-			continue
-		}
-
-		ip = normalizeIP(ip)
-		stats.parsedOK++
-
-		if !strings.HasPrefix(status, "4") {
-			continue
-		}
-		stats.total4xx++
-
-		// Initialize path tracking for this IP
-		if ipPaths[ip] == nil {
-			ipPaths[ip] = make(map[string]bool)
-		}
-
-		// Calculate score with repeat penalty
-		pathScore := calculateScore(urlPath)
-		if pathScore == VerySuspiciousBinProbesScore {
-			log.Printf("⚠️ %s made a very suspicious ip request in log line: %s", ip, strings.TrimSpace(line))
-		}
-		if ipPaths[ip][urlPath] {
-			pathScore *= conf.RepeatPenalty
-		} else {
-			ipPaths[ip][urlPath] = true
-		}
-
-		stats.ipScores[ip] += pathScore
-	}
-	return stats
-}
-
-// filterBannableIPs returns IPs that exceed the ban threshold, excluding whitelisted,
-// already-banned, and CIDR-covered IPs. Results are sorted by score descending.
-func filterBannableIPs(ipScores map[string]float64) []ipStat {
-	var toBan []ipStat
-	for ip, score := range ipScores {
-		if score < conf.BanThreshold {
-			continue
-		}
-		if whitelist[ip] || banned[ip] {
-			continue
-		}
-		if matchingRange := isIPCoveredByRanges(net.ParseIP(ip), getNftRanges()); matchingRange != nil {
-			log.Printf(warnIpInExcludedRange,
-				ip, score, matchingRange.String())
-			continue
-		}
-		toBan = append(toBan, ipStat{ip, score})
-	}
-	sort.Slice(toBan, func(i, j int) bool {
-		return toBan[i].score > toBan[j].score
-	})
-	return toBan
-}
-
-// printScanResults outputs scan statistics and the list of IPs to ban.
-func printScanResults(stats scanStats, uniqueIPs int, toBan []ipStat) {
-	fmt.Println("📊 Scan Results:")
-	fmt.Printf("   Total lines: %d\n", stats.totalLines)
-	fmt.Printf("   Parsed OK: %d\n", stats.parsedOK)
-	fmt.Printf("   4xx errors: %d\n", stats.total4xx)
-	fmt.Printf("   Unique IPs with 4xx: %d\n", uniqueIPs)
-	fmt.Printf("   IPs exceeding threshold (%.1f): %d\n", conf.BanThreshold, len(toBan))
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-}
-
-// scanFullLog reads the entire log file and processes all lines with weighted scoring
-func scanFullLog(path string) {
-	file, err := os.Open(path)
-	if err != nil {
-		log.Fatalf("❌ FATAL: Cannot open log: %v", err)
-	}
-	defer file.Close()
-
-	fmt.Printf("📖 Scanning %s...\n", path)
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-	stats := scanLogScores(file)
-	toBan := filterBannableIPs(stats.ipScores)
-	printScanResults(stats, len(stats.ipScores), toBan)
-
-	// Process IPs
-	for _, stat := range toBan {
-		if conf.PreviewMode {
-			fmt.Printf("👀 [PREVIEW] Would ban: %s (score: %.1f)\n", stat.ip, stat.score)
-		} else {
-			executeBan(stat.ip, stat.score)
-		}
-	}
-
-	if len(toBan) == 0 {
-		fmt.Println("✅ No IPs exceed the ban threshold.")
-	}
-}
-
-// --- Internal Utilities ---
-
-func tryMatch(re *regexp.Regexp, line string) (string, string, bool) {
-	m := re.FindStringSubmatch(line)
-	if len(m) < 3 {
-		return "", "", false
-	}
-	return m[1], m[2], true
-}
-
-// tryMatchWithPath extracts IP, URL path, and status from log line
-// Returns: IP, urlPath, status, matched
-func tryMatchWithPath(re *regexp.Regexp, line string) (string, string, string, bool) {
-	m := re.FindStringSubmatch(line)
-	if len(m) < 4 {
-		return "", "", "", false
-	}
-	return m[1], m[2], m[3], true
-}
-
-func isValidIP(ipStr string) bool {
-	return net.ParseIP(ipStr) != nil
-}
-
-// normalizeIP returns the canonical string representation of an IP address.
-// This ensures IPv6 variants like "::1" and "0:0:0:0:0:0:0:1" produce the same key.
-func normalizeIP(ipStr string) string {
-	parsed := net.ParseIP(ipStr)
-	if parsed == nil {
-		return ipStr // Shouldn't happen after isValidIP check, but be safe
-	}
-	return parsed.String()
-}
-
-func loadSafetyWhitelist() {
-	whitelist[normalizeIP("127.0.0.1")] = true
-	whitelist[normalizeIP("::1")] = true
-
-	// Import current SSH Session
-	if ssh := os.Getenv("SSH_CONNECTION"); ssh != "" {
-		fields := strings.Fields(ssh)
-		if len(fields) > 0 && isValidIP(fields[0]) {
-			normalized := normalizeIP(fields[0])
-			log.Printf("🛡️  SAFETY: Whitelisting current SSH session IP: %s", normalized)
-			whitelist[normalized] = true
-		}
-	}
-
-	// Import from File
-	file, err := os.Open(conf.WhitelistPath)
-	if err == nil {
-		defer file.Close()
-		s := bufio.NewScanner(file)
-		for s.Scan() {
-			ip := strings.TrimSpace(s.Text())
-			if isValidIP(ip) {
-				whitelist[normalizeIP(ip)] = true
-			}
-		}
-	}
-
-	// Import from UFW status if available
-	out, err := exec.Command(ufwPath, "status").Output()
-	if err == nil {
-		reIP := regexp.MustCompile(`(\d{1,3}(?:\.\d{1,3}){3})`)
-		for _, ip := range reIP.FindAllString(string(out), -1) {
-			whitelist[normalizeIP(ip)] = true
-		}
-	}
-}
-
-// loadNftablesRanges extracts CIDR ranges (e.g., 192.168.1.0/24) from the nftables config file.
-// These ranges are used to check whether an IP is already covered by a broad subnet rule
-// before issuing individual nft add element commands.
-func loadNftablesRanges(path string) ([]*net.IPNet, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var ranges []*net.IPNet
-	// Regex to find CIDR patterns (e.g., 20.160.0.0/12, 192.168.1.0/24)
-	// Mask limited to 1-2 digits to reject nonsensical values like /999
-	reCIDR := regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}`)
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// FindAllString captures all CIDRs on a line (handles comma-separated elements)
-		matches := reCIDR.FindAllString(line, -1)
-		for _, match := range matches {
-			_, network, err := net.ParseCIDR(match)
-			if err == nil {
-				ranges = append(ranges, network)
-			}
-		}
-	}
-	return ranges, scanner.Err()
-}
-
-// isIPCoveredByRanges checks if the given IP falls within any of the provided CIDR ranges.
-// Returns the matching network if found, nil otherwise.
-func isIPCoveredByRanges(ip net.IP, ranges []*net.IPNet) *net.IPNet {
-	for _, r := range ranges {
-		if r.Contains(ip) {
-			return r
-		}
-	}
-	return nil
-}
-
-// getNftRanges returns a snapshot of the current nftRanges under read lock.
-// This allows safe concurrent reload of CIDR ranges via SIGHUP while
-// processLine and filterBannableIPs continue to run without interruption.
-func getNftRanges() []*net.IPNet {
-	nftRangesMu.RLock()
-	defer nftRangesMu.RUnlock()
-	return nftRanges
-}
-
-// syncIPToNftSet ensures an IP is present in the appropriate nftables set.
-// Duplicates are silently ignored (common during restart or banned list resync).
-func syncIPToNftSet(normalized string, parsedIP net.IP) {
-	setName := conf.NftSetName
-	if parsedIP != nil && parsedIP.To4() == nil {
-		setName = conf.NftSetNameV6
-	}
-
-	if _, _, err := addIPToNFTSet(normalized, setName); err != nil {
-		log.Printf("❌ ERROR: Failed to ensure %s is in nftables set %s: %v", normalized, setName, err)
-	}
-}
-
-func loadAndSyncBannedList(nftRanges []*net.IPNet) {
-	file, err := os.Open(conf.BannedPath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	s := bufio.NewScanner(file)
-	for s.Scan() {
-		ip := strings.TrimSpace(s.Text())
-		if !isValidIP(ip) {
-			continue
-		}
-
-		normalized := normalizeIP(ip)
-		parsedIP := net.ParseIP(normalized)
-
-		// Check if this IP is already covered by a broad CIDR range in nftables.conf
-		if matchingRange := isIPCoveredByRanges(parsedIP, nftRanges); matchingRange != nil {
-			// This is a warning: receiving traffic from a range that should already
-			// be blocked suggests nftables may not be running or misconfigured.
-			log.Printf(warnIpInExcludedRange, normalized, 0.0, matchingRange.String())
-			// Still mark as banned in memory so tail/scan won't re-process it
-			mu.Lock()
-			banned[normalized] = true
-			mu.Unlock()
-			continue
-		}
-
-		mu.Lock()
-		if !banned[normalized] {
-			banned[normalized] = true
-			syncIPToNftSet(normalized, parsedIP)
-		}
-		mu.Unlock()
-	}
-}
-
-func janitor(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// Cache has its own internal lock now, no need for global mu
-			visitorCache.CleanExpired(conf.Window)
-		}
-	}
-}
-
-// --- Environment Variable Helpers ---
-
-func getEnv(key, fallback string) string {
-	if val, ok := os.LookupEnv(key); ok {
-		// Strip surrounding quotes if present (common in .env files)
-		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
-			return val[1 : len(val)-1]
-		}
-		return val
-	}
-	return fallback
-}
-
-func getEnvInt(key string, fallback int) int {
-	s := getEnv(key, "")
-	if i, err := strconv.Atoi(s); err == nil {
-		return i
-	}
-	return fallback
-}
-
-func getEnvDuration(key string, fallback time.Duration) time.Duration {
-	s := getEnv(key, "")
-	if d, err := time.ParseDuration(s); err == nil {
-		return d
-	}
-	return fallback
-}
-
-func getEnvBool(key string, fallback bool) bool {
-	s := strings.ToLower(getEnv(key, ""))
-	if s == "true" || s == "1" || s == "yes" {
-		return true
-	}
-	if s == "false" || s == "0" || s == "no" {
-		return false
-	}
-	return fallback
-}
-
-func getEnvFloat(key string, fallback float64) float64 {
-	s := getEnv(key, "")
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		return f
-	}
-	return fallback
-}
-
-// loadRules parses the rules configuration file and populates the rules slice.
-// It builds a fresh slice then swaps it under rulesMu so that SIGHUP reload
-// is safe and does not lose previous rules on transient read errors.
-// The append-to-global bug is eliminated: we never append to the live slice.
-func loadRules(path string) {
-	file, err := os.Open(path)
-	if err != nil {
-		log.Printf("⚠️  WARN: Cannot open rules file '%s': %v (using default scoring)", path, err)
-		return
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	lineNum := 0
-	var loaded []Rule
-
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// Parse format: <score> <regex_pattern>
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
-			log.Printf("⚠️  WARN: Invalid rule format at line %d: %s", lineNum, line)
-			continue
-		}
-
-		score, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-		if err != nil {
-			log.Printf("⚠️  WARN: Invalid score at line %d: %s", lineNum, parts[0])
-			continue
-		}
-
-		pattern := strings.TrimSpace(parts[1])
-
-		// Defense-in-depth: reject excessively long patterns
-		if len(pattern) > maxPatternLength {
-			log.Printf("⚠️  WARN: Rejecting rule at line %d: pattern too long (%d chars, max %d)", lineNum, len(pattern), maxPatternLength)
-			continue
-		}
-
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			log.Printf("⚠️  WARN: Invalid regex at line %d: %s (%v)", lineNum, pattern, err)
-			continue
-		}
-
-		// Warn if score exceeds per-hit cap (it will be clamped at runtime)
-		if score > maxScorePerHit {
-			log.Printf("⚠️  WARN: Rule at line %d has score %.1f exceeding cap %.1f (will be clamped)", lineNum, score, maxScorePerHit)
-		}
-
-		loaded = append(loaded, Rule{Score: score, Pattern: re, Raw: pattern})
-	}
+func reloadConfiguration() {
+	theGlobalMonitor.SetConfForTest(conf)
+	theGlobalMonitor.ReloadConfiguration()
 
 	rulesMu.Lock()
-	rules = loaded
+	theGlobalMonitor.SyncRulesToGlobalForTest(&rules)
 	rulesMu.Unlock()
 
-	log.Printf("📋 Loaded %d threat detection rules from %s", len(loaded), path)
+	nftRangesMu.Lock()
+	theGlobalMonitor.SyncNftRangesToGlobalForTest(&nftRanges)
+	nftRangesMu.Unlock()
 }
 
-// calculateScore determines the score for a given URL path based on loaded rules.
-// All scores are clamped to maxScorePerHit to prevent runaway banning from
-// misconfigured rules.
-func calculateScore(urlPath string) float64 {
-	// Binary probes: empty path means malformed/garbage request (RDP, TLS, SMB probes)
-	// These are extremely malicious - instant ban worthy
-	if urlPath == "" {
-		return VerySuspiciousBinProbesScore // Critical: binary protocol probe detected
-	}
-
-	rulesMu.RLock()
-	rs := rules
-	rulesMu.RUnlock()
-
-	for _, rule := range rs {
-		if rule.Pattern.MatchString(urlPath) {
-			// Clamp score to prevent single-hit instant bans from misconfigured rules
-			if rule.Score > maxScorePerHit {
-				return maxScorePerHit
-			}
-			return rule.Score
-		}
-	}
-	// Default score for unmatched paths
-	return 1.0
+func isIPCoveredByRanges(ip net.IP, ranges []*net.IPNet) *net.IPNet {
+	// Delegate to firewall (or could expose on Monitor). Use the passed-in ranges for legacy test compatibility.
+	return firewall.IsCoveredByRange(ip, ranges)
 }
 
-// reloadConfiguration reloads rules.conf and nftables CIDR ranges from disk.
-// It is intended to be called on SIGHUP.
-// It deliberately does NOT:
-//   - touch visitorCache (accumulated scores)
-//   - touch banned map or re-add to nftables (avoids spurious "already exist" warnings)
-//   - cancel the context or restart tailLog (monitoring continues seamlessly)
-func reloadConfiguration() {
-	log.Println("📋 Rechargement de la configuration via SIGHUP...")
-
-	// Reload threat detection rules using the path configured at start (RULES_PATH).
-	if conf.RulesPath != "" {
-		loadRules(conf.RulesPath)
-	} else {
-		rulesMu.Lock()
-		rules = nil
-		rulesMu.Unlock()
-	}
-
-	// Reload CIDR ranges used only for pre-checks (skip individual ban of IPs
-	// already covered by broad ranges in /etc/nftables.conf).
-	// Note: this does NOT reload the kernel nftables ruleset itself.
-	newRanges, err := loadNftablesRanges(conf.NftablesConfPath)
-	if err != nil {
-		log.Printf("⚠️  WARN: Cannot reload nftables config '%s': %v (keeping previous ranges)", conf.NftablesConfPath, err)
-	} else {
-		nftRangesMu.Lock()
-		nftRanges = newRanges
-		nftRangesMu.Unlock()
-		if len(newRanges) > 0 {
-			log.Printf("📋 Reloaded %d CIDR ranges from %s", len(newRanges), conf.NftablesConfPath)
-		}
-	}
-
-	log.Printf("📋 Configuration rechargée via SIGHUP (rules + CIDRs)")
+func loadNftablesRanges(p string) ([]*net.IPNet, error) {
+	return theGlobalMonitor.LoadNftablesRanges(p)
 }
 
 func main() {
@@ -993,31 +170,27 @@ func main() {
 
 	fmt.Printf("🚀 🛡️ Starting App:'%s', ver:%s, Repo: %s\n", APP, VERSION, REPOSITORY)
 
-	if conf.PreviewMode {
+	m := monitor.New(config.Load())
+
+	if m.Conf().PreviewMode {
 		fmt.Println("🔍 PREVIEW MODE: No real bans will be issued.")
-		// Clear any stale banned state so preview tracks threats fresh
-		mu.Lock()
-		banned = make(map[string]bool)
-		mu.Unlock()
-		log.Println("🧹 Preview mode: cleared banned map for clean tracking")
+		m.ClearBannedForPreview()
 	}
-	if conf.ScanAllMode {
+	if m.Conf().ScanAllMode {
 		fmt.Println("📊 SCAN ALL MODE: Reading entire log file...")
 	}
 
-	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // ← Ensures cleanup when main() exits naturally.
+	defer cancel()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	// Signal handler: SIGHUP triggers config reload without interrupting tailLog.
-	// INT/TERM trigger graceful shutdown as before.
 	go func() {
 		for {
 			sig := <-sigChan
 			if sig == syscall.SIGHUP {
-				reloadConfiguration()
+				m.ReloadConfiguration()
 				continue
 			}
 			log.Printf("\n🛑 Received %v, shutting down gracefully...", sig)
@@ -1026,40 +199,27 @@ func main() {
 		}
 	}()
 
-	// 1. Safety Phase
-	loadSafetyWhitelist()
-
-	// 2. Load nftables CIDR ranges (always, even in preview — for informational warnings).
-	// Protected by nftRangesMu so that later SIGHUP reloads are race-free.
-	var err error
-	initialRanges, err := loadNftablesRanges(conf.NftablesConfPath)
+	initialRanges, err := m.LoadNftablesRanges(m.Conf().NftablesConfPath)
 	if err != nil {
-		log.Printf("⚠️  WARN: Cannot read nftables config '%s': %v (skipping range check)", conf.NftablesConfPath, err)
+		log.Printf("⚠️  WARN: Cannot read nftables config '%s': %v (skipping range check)", m.Conf().NftablesConfPath, err)
 	} else {
-		nftRangesMu.Lock()
-		nftRanges = initialRanges
-		nftRangesMu.Unlock()
-	}
-	if len(initialRanges) > 0 {
-		log.Printf("📋 Loaded %d CIDR ranges from %s", len(initialRanges), conf.NftablesConfPath)
+		m.SetNftRanges(initialRanges)
+		if len(initialRanges) > 0 {
+			log.Printf("📋 Loaded %d CIDR ranges from %s", len(initialRanges), m.Conf().NftablesConfPath)
+		}
 	}
 
-	// 3. Sync Phase (Skip kernel sync if in preview)
-	if !conf.PreviewMode {
-		loadAndSyncBannedList(initialRanges)
+	if !m.Conf().PreviewMode {
+		m.LoadAndSyncBannedList(initialRanges)
 	}
 
-	// 3. Scan All Mode - process entire log file first
-	if conf.ScanAllMode {
-		scanFullLog(conf.LogPath)
-		return // Exit after scan in this mode
+	if m.Conf().ScanAllMode {
+		m.ScanFullLog(m.Conf().LogPath)
+		return
 	}
 
-	// 4. Maintenance Phase (only for tail mode)
-	go janitor(ctx)
-
-	// 5. Execution Phase
-	tailLog(ctx, conf.LogPath)
+	go m.Janitor(ctx)
+	m.TailLog(ctx, m.Conf().LogPath)
 
 	log.Println("✅ LogScythe stopped.")
 }

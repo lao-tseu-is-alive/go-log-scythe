@@ -37,7 +37,24 @@ Unlike legacy tools or shell scripts, **LogScythe** uses lookup tables, meaning 
 
 > See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
+## 🗂️ Project Structure
+
+```
+cmd/goLogScythe/          # Thin entrypoint (main + minimal shims)
+internal/
+    cache/                # Thread-safe LRU visitor cache
+    config/               # Env var loading + defaults
+    firewall/             # nftables operations (AddIP + ranges)
+    monitor/              # Central orchestrator (Monitor + pipeline, tail/scan/janitor/reload)
+    parser/               # Log parsing + IP handling
+    safety/               # Whitelist (SSH + UFW)
+    scoring/              # rules.conf + weighted scoring
+```
+
+The goal is a small `cmd/` with all logic in `internal/`. See [internal/README.md](internal/README.md).
+
 ---
+
 ![](https://raw.githubusercontent.com/lao-tseu-is-alive/go-log-scythe/refs/heads/main/images/goLogScythe.jpg)
 
 ---
@@ -566,6 +583,12 @@ journalctl -u go-log-scythe -f
 ## 🤝 Contributing
 
 Help us get rid of parasites! If you have a better regex for a specific web server, new threat patterns for `rules.conf`, or a performance tweak, feel free to open a PR.
+
+**When making structural or behavioral changes**, please:
+- Update `CHANGELOG.md`
+- Update relevant sections in `README.md`
+- Consider whether new or moved logic belongs in one of the `internal/` packages
+- For AI agents: see root `AGENTS.md` + `internal/README.md`
 
 **LogScythe** — *Clean logs. Fast servers. No parasites.*
 

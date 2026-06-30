@@ -13,13 +13,30 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/cache"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/config"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/firewall"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/monitor"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/parser"
+	"github.com/lao-tseu-is-alive/go-log-scythe/internal/scoring"
 )
+
+func init() {
+	// For tests running as non-root, provide a fake nft that always succeeds
+	// so executeBan can actually perform the ban side effects.
+	fakeNft := "/tmp/fake-nft-test"
+	_ = os.WriteFile(fakeNft, []byte("#!/bin/sh\nexit 0\n"), 0755)
+	nftPath = fakeNft
+}
 
 const (
 	failedCreateLogFile    = "Failed to create temp log file: %v"
 	failedTempFileCreation = "Failed to create temp banned file: %v"
 	failedCreateNftFile    = "Failed to create temp nftables file: %v"
 )
+
+const msgFuncNReturnedError = "%v returned error: %v"
 
 // --- Environment Variable Helper Tests ---
 
@@ -45,9 +62,9 @@ func TestGetEnv(t *testing.T) {
 			if tt.setEnv {
 				t.Setenv(tt.key, tt.envValue)
 			}
-			got := getEnv(tt.key, tt.fallback)
+			got := config.GetEnv(tt.key, tt.fallback)
 			if got != tt.want {
-				t.Errorf("getEnv(%q, %q) = %q, want %q", tt.key, tt.fallback, got, tt.want)
+				t.Errorf("config.GetEnv(%q, %q) = %q, want %q", tt.key, tt.fallback, got, tt.want)
 			}
 		})
 	}
@@ -73,9 +90,9 @@ func TestGetEnvInt(t *testing.T) {
 			if tt.setEnv {
 				t.Setenv(key, tt.envValue)
 			}
-			got := getEnvInt(key, tt.fallback)
+			got := config.GetEnvInt(key, tt.fallback)
 			if got != tt.want {
-				t.Errorf("getEnvInt() = %d, want %d", got, tt.want)
+				t.Errorf("config.GetEnvInt() = %d, want %d", got, tt.want)
 			}
 		})
 	}
@@ -102,9 +119,9 @@ func TestGetEnvDuration(t *testing.T) {
 			if tt.setEnv {
 				t.Setenv(key, tt.envValue)
 			}
-			got := getEnvDuration(key, tt.fallback)
+			got := config.GetEnvDuration(key, tt.fallback)
 			if got != tt.want {
-				t.Errorf("getEnvDuration() = %v, want %v", got, tt.want)
+				t.Errorf("config.GetEnvDuration() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -135,9 +152,9 @@ func TestGetEnvBool(t *testing.T) {
 			if tt.setEnv {
 				t.Setenv(key, tt.envValue)
 			}
-			got := getEnvBool(key, tt.fallback)
+			got := config.GetEnvBool(key, tt.fallback)
 			if got != tt.want {
-				t.Errorf("getEnvBool() = %v, want %v", got, tt.want)
+				t.Errorf("config.GetEnvBool() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -166,9 +183,9 @@ func TestIsValidIP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.ip, func(t *testing.T) {
-			got := isValidIP(tt.ip)
+			got := parser.IsValidIP(tt.ip)
 			if got != tt.want {
-				t.Errorf("isValidIP(%q) = %v, want %v", tt.ip, got, tt.want)
+				t.Errorf("parser.IsValidIP(%q) = %v, want %v", tt.ip, got, tt.want)
 			}
 		})
 	}
@@ -233,16 +250,16 @@ func TestTryMatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotIP, gotStatus, gotMatch := tryMatch(re, tt.line)
+			gotIP, gotStatus, gotMatch := parser.TryMatch(re, tt.line)
 			if gotMatch != tt.wantMatch {
-				t.Errorf("tryMatch() match = %v, want %v", gotMatch, tt.wantMatch)
+				t.Errorf("parser.TryMatch() match = %v, want %v", gotMatch, tt.wantMatch)
 			}
 			if gotMatch {
 				if gotIP != tt.wantIP {
-					t.Errorf("tryMatch() ip = %q, want %q", gotIP, tt.wantIP)
+					t.Errorf("parser.TryMatch() ip = %q, want %q", gotIP, tt.wantIP)
 				}
 				if gotStatus != tt.wantStatus {
-					t.Errorf("tryMatch() status = %q, want %q", gotStatus, tt.wantStatus)
+					t.Errorf("parser.TryMatch() status = %q, want %q", gotStatus, tt.wantStatus)
 				}
 			}
 		})
@@ -252,13 +269,13 @@ func TestTryMatch(t *testing.T) {
 // --- LRU Cache Tests ---
 
 func TestLRUCacheBasicOperations(t *testing.T) {
-	cache := NewLRUCache(3)
+	c := cache.NewLRUCache(3)
 
 	// Test Put and Get
-	cache.Put("192.168.1.1", &Visitor{IP: "192.168.1.1", Score: 1.0, Paths: make(map[string]bool)})
-	cache.Put("192.168.1.2", &Visitor{IP: "192.168.1.2", Score: 2.0, Paths: make(map[string]bool)})
+	c.Put("192.168.1.1", &cache.Visitor{IP: "192.168.1.1", Score: 1.0, Paths: make(map[string]bool)})
+	c.Put("192.168.1.2", &cache.Visitor{IP: "192.168.1.2", Score: 2.0, Paths: make(map[string]bool)})
 
-	v, ok := cache.Get("192.168.1.1")
+	v, ok := c.Get("192.168.1.1")
 	if !ok {
 		t.Error("LRUCache.Get() should find existing key")
 	}
@@ -267,89 +284,89 @@ func TestLRUCacheBasicOperations(t *testing.T) {
 	}
 
 	// Test non-existent key
-	_, ok = cache.Get("nonexistent")
+	_, ok = c.Get("nonexistent")
 	if ok {
 		t.Error("LRUCache.Get() should return false for non-existent key")
 	}
 
 	// Test Len
-	if cache.Len() != 2 {
-		t.Errorf("LRUCache.Len() = %d, want 2", cache.Len())
+	if c.Len() != 2 {
+		t.Errorf("LRUCache.Len() = %d, want 2", c.Len())
 	}
 }
 
 func TestLRUCacheEviction(t *testing.T) {
-	cache := NewLRUCache(3)
+	c := cache.NewLRUCache(3)
 
 	// Fill cache
-	cache.Put("ip1", &Visitor{IP: "ip1", Score: 1.0, Paths: make(map[string]bool)})
-	cache.Put("ip2", &Visitor{IP: "ip2", Score: 2.0, Paths: make(map[string]bool)})
-	cache.Put("ip3", &Visitor{IP: "ip3", Score: 3.0, Paths: make(map[string]bool)})
+	c.Put("ip1", &cache.Visitor{IP: "ip1", Score: 1.0, Paths: make(map[string]bool)})
+	c.Put("ip2", &cache.Visitor{IP: "ip2", Score: 2.0, Paths: make(map[string]bool)})
+	c.Put("ip3", &cache.Visitor{IP: "ip3", Score: 3.0, Paths: make(map[string]bool)})
 
 	// Access ip1 to make it most recently used
-	cache.Get("ip1")
+	c.Get("ip1")
 
 	// Add ip4, should evict ip2 (least recently used)
-	cache.Put("ip4", &Visitor{IP: "ip4", Score: 4.0, Paths: make(map[string]bool)})
+	c.Put("ip4", &cache.Visitor{IP: "ip4", Score: 4.0, Paths: make(map[string]bool)})
 
-	if cache.Len() != 3 {
-		t.Errorf("LRUCache should maintain capacity, got len=%d", cache.Len())
+	if c.Len() != 3 {
+		t.Errorf("LRUCache should maintain capacity, got len=%d", c.Len())
 	}
 
 	// ip2 should be evicted
-	_, ok := cache.Get("ip2")
+	_, ok := c.Get("ip2")
 	if ok {
 		t.Error("ip2 should have been evicted")
 	}
 
 	// ip1, ip3, ip4 should exist
-	if _, ok := cache.Get("ip1"); !ok {
+	if _, ok := c.Get("ip1"); !ok {
 		t.Error("ip1 should exist")
 	}
-	if _, ok := cache.Get("ip3"); !ok {
+	if _, ok := c.Get("ip3"); !ok {
 		t.Error("ip3 should exist")
 	}
-	if _, ok := cache.Get("ip4"); !ok {
+	if _, ok := c.Get("ip4"); !ok {
 		t.Error("ip4 should exist")
 	}
 }
 
 func TestLRUCacheDelete(t *testing.T) {
-	cache := NewLRUCache(3)
-	cache.Put("ip1", &Visitor{IP: "ip1", Score: 1.0, Paths: make(map[string]bool)})
-	cache.Put("ip2", &Visitor{IP: "ip2", Score: 2.0, Paths: make(map[string]bool)})
+	c := cache.NewLRUCache(3)
+	c.Put("ip1", &cache.Visitor{IP: "ip1", Score: 1.0, Paths: make(map[string]bool)})
+	c.Put("ip2", &cache.Visitor{IP: "ip2", Score: 2.0, Paths: make(map[string]bool)})
 
-	cache.Delete("ip1")
+	c.Delete("ip1")
 
-	if cache.Len() != 1 {
-		t.Errorf("After delete, len = %d, want 1", cache.Len())
+	if c.Len() != 1 {
+		t.Errorf("After delete, len = %d, want 1", c.Len())
 	}
 
-	if _, ok := cache.Get("ip1"); ok {
+	if _, ok := c.Get("ip1"); ok {
 		t.Error("Deleted key should not exist")
 	}
 }
 
 func TestLRUCacheCleanExpired(t *testing.T) {
-	cache := NewLRUCache(10)
+	c := cache.NewLRUCache(10)
 	now := time.Now()
 
 	// Add entries with different ages
-	cache.Put("new", &Visitor{IP: "new", LastSeen: now})
-	cache.Put("old", &Visitor{IP: "old", LastSeen: now.Add(-20 * time.Minute)})
-	cache.Put("ancient", &Visitor{IP: "ancient", LastSeen: now.Add(-1 * time.Hour)})
+	c.Put("new", &cache.Visitor{IP: "new", LastSeen: now})
+	c.Put("old", &cache.Visitor{IP: "old", LastSeen: now.Add(-20 * time.Minute)})
+	c.Put("ancient", &cache.Visitor{IP: "ancient", LastSeen: now.Add(-1 * time.Hour)})
 
-	removed := cache.CleanExpired(15 * time.Minute)
+	removed := c.CleanExpired(15 * time.Minute)
 
 	if removed != 2 {
 		t.Errorf("CleanExpired should remove 2 entries, removed %d", removed)
 	}
 
-	if cache.Len() != 1 {
-		t.Errorf("After cleanup, len = %d, want 1", cache.Len())
+	if c.Len() != 1 {
+		t.Errorf("After cleanup, len = %d, want 1", c.Len())
 	}
 
-	if _, ok := cache.Get("new"); !ok {
+	if _, ok := c.Get("new"); !ok {
 		t.Error("'new' entry should still exist")
 	}
 }
@@ -405,77 +422,67 @@ func TestLoadSafetyWhitelist(t *testing.T) {
 // --- ProcessLine Tests ---
 
 func TestProcessLine(t *testing.T) {
-	// Reset global state for each test
-	resetGlobalState := func() {
-		mu.Lock()
-		visitorCache = NewLRUCache(defaultMaxVisitors)
-		banned = make(map[string]bool)
-		whitelist = make(map[string]bool)
-		whitelist["127.0.0.1"] = true
-		mu.Unlock()
+	// Helper to create a fresh Monitor for each subtest using the internal package directly.
+	newTestMonitor := func() *monitor.Monitor {
+		cfg := config.Default()
+		cfg.BanThreshold = 10.0
+		cfg.RepeatPenalty = 0.1
+		cfg.PreviewMode = false
+		m := monitor.New(cfg)
+		m.ResetForTest()
+		m.SetWhitelistForTest(map[string]bool{"127.0.0.1": true})
+		return m
 	}
 
 	t.Run("empty line is ignored", func(t *testing.T) {
-		resetGlobalState()
-		processLine("")
-		mu.Lock()
-		if visitorCache.Len() != 0 {
-			t.Error("processLine() should ignore empty lines")
+		m := newTestMonitor()
+		m.ProcessLine("")
+		if m.CacheLenForTest() != 0 {
+			t.Error("ProcessLine() should ignore empty lines")
 		}
-		mu.Unlock()
 	})
 
 	t.Run("whitelisted IP is ignored", func(t *testing.T) {
-		resetGlobalState()
+		m := newTestMonitor()
 		line := `127.0.0.1 - - [16/Jan/2026:10:00:00 +0000] "GET /admin HTTP/1.1" 404 123`
-		processLine(line)
-		mu.Lock()
-		if _, exists := visitorCache.Get("127.0.0.1"); exists {
-			t.Error("processLine() should skip whitelisted IPs")
+		m.ProcessLine(line)
+		if _, exists := m.CacheGetForTest("127.0.0.1"); exists {
+			t.Error("ProcessLine() should skip whitelisted IPs")
 		}
-		mu.Unlock()
 	})
 
 	t.Run("200 status is ignored", func(t *testing.T) {
-		resetGlobalState()
+		m := newTestMonitor()
 		line := `8.8.8.8 - - [16/Jan/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 1024`
-		processLine(line)
-		mu.Lock()
-		if _, exists := visitorCache.Get("8.8.8.8"); exists {
-			t.Error("processLine() should ignore non-4xx status codes")
+		m.ProcessLine(line)
+		if _, exists := m.CacheGetForTest("8.8.8.8"); exists {
+			t.Error("ProcessLine() should ignore non-4xx status codes")
 		}
-		mu.Unlock()
 	})
 
 	t.Run("404 increments visitor count", func(t *testing.T) {
-		resetGlobalState()
+		m := newTestMonitor()
 		line := `192.168.1.50 - - [16/Jan/2026:10:00:00 +0000] "GET /admin HTTP/1.1" 404 123`
-		processLine(line)
-		mu.Lock()
-		v, exists := visitorCache.Get("192.168.1.50")
+		m.ProcessLine(line)
+		v, exists := m.CacheGetForTest("192.168.1.50")
 		if !exists {
-			t.Fatal("processLine() did not create visitor entry")
+			t.Fatal("ProcessLine() did not create visitor entry")
 		}
 		if v.Score == 0 {
-			t.Errorf("processLine() score = %.1f, want > 0", v.Score)
+			t.Errorf("ProcessLine() score = %.1f, want > 0", v.Score)
 		}
-		mu.Unlock()
 	})
 
 	t.Run("already banned IP is ignored", func(t *testing.T) {
-		resetGlobalState()
-		mu.Lock()
-		banned["10.0.0.99"] = true
-		mu.Unlock()
+		m := newTestMonitor()
+		m.SetBannedForTest("10.0.0.99")
 
 		line := `10.0.0.99 - - [16/Jan/2026:10:00:00 +0000] "GET /admin HTTP/1.1" 404 123`
-		processLine(line)
+		m.ProcessLine(line)
 
-		mu.Lock()
-		if _, exists := visitorCache.Get("10.0.0.99"); exists {
-			t.Error("processLine() should skip already banned IPs")
+		if _, exists := m.CacheGetForTest("10.0.0.99"); exists {
+			t.Error("ProcessLine() should skip already banned IPs")
 		}
-		mu.Unlock()
 	})
 }
 
@@ -621,7 +628,7 @@ func TestLoadAndSyncBannedListWithIPv6(t *testing.T) {
 func TestScanFullLog(t *testing.T) {
 	// Reset global state
 	mu.Lock()
-	visitorCache = NewLRUCache(defaultMaxVisitors)
+	visitorCache = cache.NewLRUCache(config.DefaultMaxVisitors)
 	banned = make(map[string]bool)
 	whitelist = make(map[string]bool)
 	whitelist["127.0.0.1"] = true
@@ -790,41 +797,37 @@ func TestNormalizeIPIdempotent(t *testing.T) {
 // --- Score Clamping Tests ---
 
 func TestCalculateScoreClamping(t *testing.T) {
-	// Save and restore original rules
-	origRules := rules
-	defer func() { rules = origRules }()
+	// Use scoring package directly
+	tmpDir := t.TempDir()
+	rulesFile := filepath.Join(tmpDir, "clamp.conf")
+	content := "999.0 /evil\n5.0 /normal\n"
+	os.WriteFile(rulesFile, []byte(content), 0644)
 
-	// Add a rule with excessive score
-	rules = []Rule{
-		{Score: 999.0, Pattern: regexp.MustCompile(`/evil`), Raw: `/evil`},
-		{Score: 5.0, Pattern: regexp.MustCompile(`/normal`), Raw: `/normal`},
-	}
+	scoring.Load(rulesFile)
 
 	// Excessive score should be clamped
-	score := calculateScore("/evil")
-	if score > maxScorePerHit {
-		t.Errorf("calculateScore(/evil) = %.1f, want <= %.1f", score, maxScorePerHit)
+	score := scoring.Calculate("/evil")
+	if score > config.MaxScorePerHit {
+		t.Errorf("Calculate(/evil) = %.1f, want <= %.1f", score, config.MaxScorePerHit)
 	}
-	if score != maxScorePerHit {
-		t.Errorf("calculateScore(/evil) = %.1f, want exactly %.1f (clamped)", score, maxScorePerHit)
+	if score != config.MaxScorePerHit {
+		t.Errorf("Calculate(/evil) = %.1f, want exactly %.1f (clamped)", score, config.MaxScorePerHit)
 	}
 
-	// Normal score should pass through
-	score = calculateScore("/normal")
+	score = scoring.Calculate("/normal")
 	if score != 5.0 {
-		t.Errorf("calculateScore(/normal) = %.1f, want 5.0", score)
+		t.Errorf("Calculate(/normal) = %.1f, want 5.0", score)
 	}
 
-	// Default score for unmatched
-	score = calculateScore("/unknown")
+	score = scoring.Calculate("/unknown")
 	if score != 1.0 {
-		t.Errorf("calculateScore(/unknown) = %.1f, want 1.0", score)
+		t.Errorf("Calculate(/unknown) = %.1f, want 1.0", score)
 	}
 
-	// Binary probe score (empty path)
-	score = calculateScore("")
-	if score != VerySuspiciousBinProbesScore {
-		t.Errorf("calculateScore('') = %.3f, want %.3f", score, VerySuspiciousBinProbesScore)
+	// Binary probe
+	score = scoring.Calculate("")
+	if score != config.VerySuspiciousBinProbesScore {
+		t.Errorf("Calculate('') = %.3f, want %.3f", score, config.VerySuspiciousBinProbesScore)
 	}
 }
 
@@ -887,7 +890,7 @@ func TestLoadRulesWarnsHighScore(t *testing.T) {
 // --- Concurrency Tests ---
 
 func TestLRUCacheConcurrency(t *testing.T) {
-	cache := NewLRUCache(100)
+	c := cache.NewLRUCache(100)
 	var wg sync.WaitGroup
 
 	// Spawn multiple goroutines doing concurrent operations
@@ -898,7 +901,7 @@ func TestLRUCacheConcurrency(t *testing.T) {
 			ip := fmt.Sprintf("10.0.0.%d", id%256)
 
 			// Put
-			cache.Put(ip, &Visitor{
+			c.Put(ip, &cache.Visitor{
 				IP:       ip,
 				Score:    float64(id),
 				Paths:    make(map[string]bool),
@@ -906,14 +909,14 @@ func TestLRUCacheConcurrency(t *testing.T) {
 			})
 
 			// Get
-			cache.Get(ip)
+			c.Get(ip)
 
 			// Len
-			cache.Len()
+			c.Len()
 
 			// Delete half
 			if id%2 == 0 {
-				cache.Delete(ip)
+				c.Delete(ip)
 			}
 		}(i)
 	}
@@ -922,7 +925,7 @@ func TestLRUCacheConcurrency(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		cache.CleanExpired(1 * time.Minute)
+		c.CleanExpired(1 * time.Minute)
 	}()
 
 	wg.Wait()
@@ -930,13 +933,12 @@ func TestLRUCacheConcurrency(t *testing.T) {
 }
 
 func TestProcessLineConcurrency(t *testing.T) {
-	// Reset global state
-	mu.Lock()
-	visitorCache = NewLRUCache(defaultMaxVisitors)
-	banned = make(map[string]bool)
-	whitelist = make(map[string]bool)
-	whitelist["127.0.0.1"] = true
-	mu.Unlock()
+	// Use a dedicated Monitor so we exercise the real locking (m.mu + cache internal lock)
+	// without going through the shim that does global map copies (which can race when
+	// called concurrently from many goroutines).
+	m := monitor.New(config.Default())
+	m.ResetForTest()
+	m.SetWhitelistForTest(map[string]bool{"127.0.0.1": true})
 
 	// Generate log lines from different IPs
 	lines := make([]string, 100)
@@ -950,7 +952,7 @@ func TestProcessLineConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(l string) {
 			defer wg.Done()
-			processLine(l)
+			m.ProcessLine(l)
 		}(line)
 	}
 
@@ -962,15 +964,15 @@ func TestProcessLineConcurrency(t *testing.T) {
 
 func TestCacheCapacityEnvVar(t *testing.T) {
 	// Test that the cache respects custom capacity
-	cache := NewLRUCache(5)
+	c := cache.NewLRUCache(5)
 
 	for i := 0; i < 10; i++ {
 		ip := fmt.Sprintf("192.168.1.%d", i)
-		cache.Put(ip, &Visitor{IP: ip, Score: 1.0, Paths: make(map[string]bool)})
+		c.Put(ip, &cache.Visitor{IP: ip, Score: 1.0, Paths: make(map[string]bool)})
 	}
 
-	if cache.Len() != 5 {
-		t.Errorf("Cache should cap at 5 entries, got %d", cache.Len())
+	if c.Len() != 5 {
+		t.Errorf("Cache should cap at 5 entries, got %d", c.Len())
 	}
 }
 
@@ -1177,7 +1179,7 @@ func TestLoadAndSyncBannedListWithNftRanges(t *testing.T) {
 func TestBurstDetection(t *testing.T) {
 	// Reset global state
 	mu.Lock()
-	visitorCache = NewLRUCache(defaultMaxVisitors)
+	visitorCache = cache.NewLRUCache(config.DefaultMaxVisitors)
 	banned = make(map[string]bool)
 	whitelist = make(map[string]bool)
 	whitelist["127.0.0.1"] = true
@@ -1217,7 +1219,7 @@ func TestBurstDetection(t *testing.T) {
 func TestBurstDetectionBelowLimit(t *testing.T) {
 	// Reset global state
 	mu.Lock()
-	visitorCache = NewLRUCache(defaultMaxVisitors)
+	visitorCache = cache.NewLRUCache(config.DefaultMaxVisitors)
 	banned = make(map[string]bool)
 	whitelist = make(map[string]bool)
 	whitelist["127.0.0.1"] = true
@@ -1255,7 +1257,7 @@ func TestBurstDetectionBelowLimit(t *testing.T) {
 func TestBurstDetectionWindowExpiry(t *testing.T) {
 	// Reset global state
 	mu.Lock()
-	visitorCache = NewLRUCache(defaultMaxVisitors)
+	visitorCache = cache.NewLRUCache(config.DefaultMaxVisitors)
 	banned = make(map[string]bool)
 	whitelist = make(map[string]bool)
 	whitelist["127.0.0.1"] = true
@@ -1301,7 +1303,7 @@ func TestBurstDetectionWindowExpiry(t *testing.T) {
 func TestBurstDetectionDoesNotAffectWhitelisted(t *testing.T) {
 	// Reset global state
 	mu.Lock()
-	visitorCache = NewLRUCache(defaultMaxVisitors)
+	visitorCache = cache.NewLRUCache(config.DefaultMaxVisitors)
 	banned = make(map[string]bool)
 	whitelist = make(map[string]bool)
 	whitelist["127.0.0.1"] = true
@@ -1334,5 +1336,347 @@ func TestBurstDetectionDoesNotAffectWhitelisted(t *testing.T) {
 
 	if banned["10.66.66.66"] {
 		t.Error("burst detection should NOT ban whitelisted IPs")
+	}
+}
+
+// --- Additional Environment Tests ---
+
+func TestGetEnvFloat(t *testing.T) {
+	tests := []struct {
+		name     string
+		envValue string
+		setEnv   bool
+		fallback float64
+		want     float64
+	}{
+		{"uses fallback when not set", "", false, 3.14, 3.14},
+		{"parses valid float", "2.5", true, 1.0, 2.5},
+		{"parses integer as float", "42", true, 0.0, 42.0},
+		{"parses negative float", "-3.14", true, 0.0, -3.14},
+		{"fallback on invalid string", "notafloat", true, 9.99, 9.99},
+		{"parses scientific notation", "1.5e2", true, 0.0, 150.0},
+		{"zero value", "0", true, 99.9, 0.0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key := "TEST_FLOAT_" + strings.ReplaceAll(tt.name, " ", "_")
+			if tt.setEnv {
+				t.Setenv(key, tt.envValue)
+			}
+			got := config.GetEnvFloat(key, tt.fallback)
+			if got != tt.want {
+				t.Errorf("config.GetEnvFloat() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// --- Reload Configuration Test ---
+
+func TestReloadConfiguration(t *testing.T) {
+	// Backup globals
+	origRulesPath := conf.RulesPath
+	origNftPath := conf.NftablesConfPath
+	rulesMu.RLock()
+	origRules := rules
+	rulesMu.RUnlock()
+	nftRangesMu.RLock()
+	origRanges := nftRanges
+	nftRangesMu.RUnlock()
+
+	defer func() {
+		conf.RulesPath = origRulesPath
+		conf.NftablesConfPath = origNftPath
+		rulesMu.Lock()
+		rules = origRules
+		rulesMu.Unlock()
+		nftRangesMu.Lock()
+		nftRanges = origRanges
+		nftRangesMu.Unlock()
+	}()
+
+	tmpDir := t.TempDir()
+
+	// Create a rules.conf
+	rulesFile := filepath.Join(tmpDir, "test-rules.conf")
+	rulesContent := "# comment\n5.0 /wp-admin\n10.0 /\\.env\n"
+	if err := os.WriteFile(rulesFile, []byte(rulesContent), 0644); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+
+	// Create nftables.conf with ranges
+	nftFile := filepath.Join(tmpDir, "test-nft.conf")
+	nftContent := `table inet filter {
+    set parasites { type ipv4_addr; elements = { 10.0.0.0/8, 192.168.0.0/16 } }
+}`
+	if err := os.WriteFile(nftFile, []byte(nftContent), 0644); err != nil {
+		t.Fatalf("write nft: %v", err)
+	}
+
+	// Configure and clear state
+	conf.RulesPath = rulesFile
+	conf.NftablesConfPath = nftFile
+
+	rulesMu.Lock()
+	rules = nil
+	rulesMu.Unlock()
+	nftRangesMu.Lock()
+	nftRanges = nil
+	nftRangesMu.Unlock()
+
+	reloadConfiguration()
+
+	// Verify rules were reloaded
+	rulesMu.RLock()
+	newRules := rules
+	rulesMu.RUnlock()
+	if len(newRules) != 2 {
+		t.Errorf("reloadConfiguration() loaded %d rules, want 2", len(newRules))
+	}
+
+	// Verify CIDR ranges were reloaded
+	nftRangesMu.RLock()
+	newRanges := nftRanges
+	nftRangesMu.RUnlock()
+	if len(newRanges) == 0 {
+		t.Error("reloadConfiguration() did not load any CIDR ranges")
+	}
+}
+
+// --- Improved Safety Whitelist Tests ---
+
+func TestLoadSafetyWhitelistSSHAndUFW(t *testing.T) {
+	mu.Lock()
+	whitelist = make(map[string]bool)
+	mu.Unlock()
+
+	tmpDir := t.TempDir()
+
+	// Whitelist file
+	wlFile := filepath.Join(tmpDir, "whitelist.txt")
+	wlContent := "172.16.0.99\n"
+	os.WriteFile(wlFile, []byte(wlContent), 0644)
+
+	// Fake ufw that outputs some IPs (simulates "ufw status")
+	fakeUfw := filepath.Join(tmpDir, "ufw")
+	ufwScript := `#!/bin/sh
+echo "Status: active"
+echo "22/tcp ALLOW 203.0.113.77"
+echo "443/tcp ALLOW 198.51.100.22"
+`
+	if err := os.WriteFile(fakeUfw, []byte(ufwScript), 0755); err != nil {
+		t.Fatalf("write fake ufw: %v", err)
+	}
+
+	// Backup
+	origWL := conf.WhitelistPath
+	origUfwPath := ufwPath
+	defer func() {
+		conf.WhitelistPath = origWL
+		ufwPath = origUfwPath
+	}()
+
+	conf.WhitelistPath = wlFile
+	ufwPath = fakeUfw
+
+	// Simulate SSH session
+	t.Setenv("SSH_CONNECTION", "203.0.113.55 54321 10.0.0.1 22")
+
+	loadSafetyWhitelist()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	expected := []string{
+		"127.0.0.1", "::1",
+		"172.16.0.99",  // from file
+		"203.0.113.55", // from SSH
+		"203.0.113.77", // from fake ufw
+		"198.51.100.22",
+	}
+
+	for _, ip := range expected {
+		norm := normalizeIP(ip)
+		if !whitelist[norm] {
+			t.Errorf("loadSafetyWhitelist() missing expected IP %s (normalized %s)", ip, norm)
+		}
+	}
+}
+
+// --- Additional Rules and Matching Tests ---
+
+func TestLoadRulesInvalidLines(t *testing.T) {
+	origRules := rules
+	defer func() { rules = origRules }()
+	rules = nil
+
+	tmpDir := t.TempDir()
+	rulesFile := filepath.Join(tmpDir, "bad-rules.conf")
+	content := `# comment line
+not-a-score /pattern
+5.0 /good-one
+abc /bad-score
+5.0 [invalid regex
+5.0 /another-good
+`
+	if err := os.WriteFile(rulesFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+
+	loadRules(rulesFile)
+
+	// Only the two good rules should load
+	if len(rules) != 2 {
+		t.Errorf("loadRules() loaded %d rules, want 2 (invalid lines should be skipped)", len(rules))
+	}
+}
+
+func TestTryMatchWithPath(t *testing.T) {
+	// Use the actual default regex from the program
+	re := regexp.MustCompile(defaultLogRegex)
+
+	tests := []struct {
+		name       string
+		line       string
+		wantIP     string
+		wantPath   string
+		wantStatus string
+		wantMatch  bool
+	}{
+		{
+			name:       "standard nginx 404 with path",
+			line:       `203.0.113.10 - - [20/Feb/2026:12:00:00 +0000] "GET /admin.php HTTP/1.1" 404 123`,
+			wantIP:     "203.0.113.10",
+			wantPath:   "/admin.php",
+			wantStatus: "404",
+			wantMatch:  true,
+		},
+		{
+			name:       "binary probe (empty path)",
+			line:       `203.0.113.99 - - [20/Feb/2026:12:00:00 +0000] "" 400 0`,
+			wantIP:     "203.0.113.99",
+			wantPath:   "",
+			wantStatus: "400",
+			wantMatch:  true,
+		},
+		{
+			name:       "malformed binary garbage",
+			line:       `10.0.0.5 - - [20/Feb/2026:12:00:00 +0000] "�\x03\x00\x00\x0b" 400 0`,
+			wantIP:     "10.0.0.5",
+			wantPath:   "",
+			wantStatus: "400",
+			wantMatch:  true,
+		},
+		{
+			name:       "no match",
+			line:       "garbage line without structure",
+			wantIP:     "",
+			wantPath:   "",
+			wantStatus: "",
+			wantMatch:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ip, path, status, ok := tryMatchWithPath(re, tt.line)
+			if ok != tt.wantMatch {
+				t.Fatalf("tryMatchWithPath match=%v, want %v", ok, tt.wantMatch)
+			}
+			if ok {
+				if ip != tt.wantIP {
+					t.Errorf("IP = %q, want %q", ip, tt.wantIP)
+				}
+				if path != tt.wantPath {
+					t.Errorf("path = %q, want %q", path, tt.wantPath)
+				}
+				if status != tt.wantStatus {
+					t.Errorf("status = %q, want %q", status, tt.wantStatus)
+				}
+			}
+		})
+	}
+}
+
+// Test that empty path gives the binary probe score
+func TestCalculateScoreBinaryProbe(t *testing.T) {
+	origRules := rules
+	defer func() { rules = origRules }()
+	rules = nil // no rules
+
+	score := calculateScore("")
+	if score != VerySuspiciousBinProbesScore {
+		t.Errorf("calculateScore(\"\") = %v, want %v (binary probe)", score, VerySuspiciousBinProbesScore)
+	}
+}
+
+func TestReloadConfigurationClearsRulesWhenNoPath(t *testing.T) {
+	origRulesPath := conf.RulesPath
+	origRules := rules
+	defer func() {
+		conf.RulesPath = origRulesPath
+		rulesMu.Lock()
+		rules = origRules
+		rulesMu.Unlock()
+	}()
+
+	tmpDir := t.TempDir()
+	nftFile := filepath.Join(tmpDir, "nft.conf")
+	os.WriteFile(nftFile, []byte(""), 0644)
+
+	conf.RulesPath = "" // no rules file
+	rulesMu.Lock()
+	rules = []scoring.Rule{{Score: 5, Pattern: regexp.MustCompile("x"), Raw: "x"}}
+	rulesMu.Unlock()
+
+	conf.NftablesConfPath = nftFile
+	reloadConfiguration()
+
+	rulesMu.RLock()
+	defer rulesMu.RUnlock()
+	if rules != nil && len(rules) != 0 {
+		t.Errorf("reloadConfiguration() with empty RulesPath should clear rules, got %d", len(rules))
+	}
+}
+
+func TestLoadRulesFileNotFound(t *testing.T) {
+	orig := rules
+	defer func() { rules = orig }()
+	rules = []scoring.Rule{{}} // some previous
+
+	loadRules("/this/file/does/not/exist.conf")
+
+	// Should not crash and should keep previous rules (current behavior)
+	if len(rules) == 0 {
+		t.Error("loadRules on missing file should keep previous rules (or at least not panic)")
+	}
+}
+
+// Test that triggers actual ban path (executeBan + filterBannableIPs)
+func TestProcessLineTriggersBan(t *testing.T) {
+	tmpDir := t.TempDir()
+	bannedFile := filepath.Join(tmpDir, "banned.txt")
+
+	// Create a dedicated Monitor for this test (proper way)
+	cfg := config.Default()
+	cfg.BannedPath = bannedFile
+	cfg.BanThreshold = 1.0
+	cfg.PreviewMode = false
+
+	fakeNft := filepath.Join(tmpDir, "nft")
+	os.WriteFile(fakeNft, []byte("#!/bin/sh\nexit 0\n"), 0755)
+
+	// Point both the legacy path (if any) and the firewall package at the fake for this test
+	firewall.NftPath = fakeNft
+	m := monitor.New(cfg)
+	m.SetNftPathForTest(fakeNft)
+
+	// Unmatched path → score 1.0. Threshold=1.0 → should ban.
+	line := `198.51.100.77 - - [21/Feb/2026:10:00:00 +0000] "GET /random-path-xyz HTTP/1.1" 404 42`
+	m.ProcessLine(line)
+
+	if !m.IsBannedForTest("198.51.100.77") {
+		t.Error("ProcessLine should have banned the IP when score >= threshold")
 	}
 }

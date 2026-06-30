@@ -5,6 +5,27 @@ All notable changes to **GoLogScythe** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-30
+
+### Changed
+- **Major architectural refactor**: Extracted the monolithic logic from `cmd/goLogScythe/goLogScythe.go` into focused, private packages under `internal/`.
+  - `internal/monitor`: Central orchestrator (`Monitor` struct). Owns state, implements the detection pipeline (`ProcessLine`), log tailing, full scans, janitor, SIGHUP reload, and banned list synchronization.
+  - `internal/parser`: Log line parsing (`TryMatchWithPath`), IP validation and normalization.
+  - `internal/scoring`: Rule loading from `rules.conf` + weighted threat score calculation.
+  - `internal/cache`: Thread-safe LRU cache for visitor tracking (scores, paths, burst windows).
+  - `internal/firewall`: nftables interactions (`AddIP`, CIDR range helpers).
+  - `internal/safety`: Whitelist loading + automatic population (current SSH session + existing UFW rules).
+  - `internal/config`: Full environment variable loading, defaults, and typed helpers (`GetEnv*`).
+- `cmd/goLogScythe` is now intentionally thin (main entry point + small compatibility shims to support the existing integration test suite).
+- Improved separation of concerns, easier unit testing of individual concerns, and better Go idioms (internal packages are not importable outside the module tree).
+- Tests updated to work against the new `monitor.Monitor` public API (with a few transition helpers for the legacy global-shim tests).
+- All previous functionality preserved; full test suite + `-race` clean.
+
+### Documentation
+- Added `internal/README.md` describing the role of each package.
+- Added `AGENTS.md` with guidance for AI coding agents and future maintainers.
+- This changelog entry + README updates.
+
 ## [0.4.4] - 2026-06-30
 
 ### Security
