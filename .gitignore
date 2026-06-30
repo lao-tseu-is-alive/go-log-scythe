@@ -42,3 +42,4 @@ vdl_install
 /test/
 /banned_ranges_20260223.txt
 scripts/__pycache__/
+/reports/
