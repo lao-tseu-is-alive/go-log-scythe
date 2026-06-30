@@ -1,0 +1,7 @@
+# go.sum is present even though this module has zero external dependencies.
+# This satisfies static analysis rules (e.g. SonarQube text:S8566)
+# that expect a dependency lock file to be committed for reproducibility
+# and supply-chain protection.
+#
+# No actual checksums are needed here because there are no 'require' entries
+# in go.mod. See: https://go.dev/ref/mod#go-sum-files
