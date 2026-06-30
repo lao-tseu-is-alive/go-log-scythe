@@ -32,7 +32,7 @@ import (
 const (
 	APP                          = "goLogScythe"
 	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.4.2"
+	VERSION                      = "0.4.3"
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
@@ -211,6 +211,13 @@ var (
 	reOverride *regexp.Regexp
 	rules      []Rule // Loaded threat detection rules
 )
+
+// nftDuplicateMessages lists the substrings that nft reports when an element
+// is already present in a set. These cases are treated as success (idempotent).
+var nftDuplicateMessages = []string{
+	"File exists",
+	"already exists",
+}
 
 func init() {
 	// Initialize configuration from Environment Variables
@@ -429,13 +436,13 @@ func executeBan(ip string, score float64) {
 		setName = conf.NftSetNameV6
 	}
 
-	// 1. Kernel Action
-	// Note: exec.Command does NOT use shell interpretation — each argument is passed
-	// directly to the exec syscall. Combined with net.ParseIP validation upstream,
-	// this is safe against command injection.
-	cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", ip, "}")
-	if err := cmd.Run(); err != nil {
+	// 1. Kernel Action (idempotent)
+	ok, _, err := addIPToNFTSet(ip, setName)
+	if err != nil {
 		log.Printf("❌ ERROR: Failed to ban %s in nftables set %s: %v", ip, setName, err)
+		return
+	}
+	if !ok {
 		return
 	}
 
@@ -450,6 +457,30 @@ func executeBan(ip string, score float64) {
 	}
 
 	log.Printf("🚫 BANNED: %s (set: %s)", ip, setName)
+}
+
+// addIPToNFTSet tries to add an IP to an nftables set in an idempotent way.
+// It returns:
+//
+//	ok        = true if the element is now present in the set (newly added or was already there)
+//	duplicate = true if it was already present (the call was effectively a no-op)
+//	err       = non-nil only for real failures
+func addIPToNFTSet(ip string, setName string) (ok, duplicate bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "nft", "add", "element", "inet", "filter", setName, "{", ip, "}")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := strings.TrimSpace(string(output))
+		for _, msg := range nftDuplicateMessages {
+			if strings.Contains(outStr, msg) {
+				return true, true, nil
+			}
+		}
+		return false, false, fmt.Errorf("nft add element %s to %s: %w: %s", ip, setName, err, outStr)
+	}
+	return true, false, nil
 }
 
 // ipStat holds an IP address and its cumulative threat score for scan results.
@@ -695,16 +726,16 @@ func getNftRanges() []*net.IPNet {
 	return nftRanges
 }
 
-// syncIPToNftSet adds an IP to the appropriate nftables set (IPv4 or IPv6).
+// syncIPToNftSet ensures an IP is present in the appropriate nftables set.
+// Duplicates are silently ignored (common during restart or banned list resync).
 func syncIPToNftSet(normalized string, parsedIP net.IP) {
 	setName := conf.NftSetName
 	if parsedIP != nil && parsedIP.To4() == nil {
 		setName = conf.NftSetNameV6
 	}
-	cmd := exec.Command("nft", "add", "element", "inet", "filter", setName, "{", normalized, "}")
-	if err := cmd.Run(); err != nil {
-		// Note: nft returns error if IP already in set, which is fine
-		log.Printf("⚠️  WARN: nft add element for %s: %v (may already exist)", normalized, err)
+
+	if _, _, err := addIPToNFTSet(normalized, setName); err != nil {
+		log.Printf("❌ ERROR: Failed to ensure %s is in nftables set %s: %v", normalized, setName, err)
 	}
 }
 
