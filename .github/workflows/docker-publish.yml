@@ -57,25 +57,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 2. Run your verified Trivy scanner
+      # 2. Install Trivy CLI explicitly (recommended for controlling the exact version)
+      # This replaces fragile patterns like checking out aquasecurity/trivy + running contrib/install.sh
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6 (post-2026-incident safe commit)
+        with:
+          trivy-version: '0.69.3' # Safe version (see https://github.com/aquasecurity/trivy/discussions/10425). Avoid v0.69.1 and the malicious 0.69.4
+
+      # 3. Run Trivy vulnerability scanner on the built image
       - name: Run Trivy vulnerability scanner
-        # v0.34.0 - pinned to commit SHA to prevent supply chain attacks,
-        # see: https://docs.github.com/en/actions/reference/security/secure-use#using-third-party-actions
-        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284
+        # pinned to commit SHA to prevent supply chain attacks
+        uses: aquasecurity/trivy-action@cf5c088a69634cd13ccddc735d7926162c31f9a6
         with:
           image-ref: 'go-log-scythe:test'
           severity: 'MEDIUM,CRITICAL,HIGH'
           ignore-unfixed: true
           format: 'sarif'
           output: 'trivy-results.sarif'
+          trivy-version: '0.69.3' # Match the CLI version for consistency
 
-      # 3. Upload results to the Security tab
+      # 4. Upload results to the Security tab
       - name: Upload Trivy scan results
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: 'trivy-results.sarif'
 
-      # 4. Final Push - Only if previous steps (including scan) succeeded
+      # 5. Final Push - Only if previous steps (including scan) succeeded
       - name: Extract Docker metadata
         id: meta
         # v5 - pinned to commit SHA to prevent supply chain attacks,
