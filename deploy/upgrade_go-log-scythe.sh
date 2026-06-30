@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="0.4.2"
+VERSION="0.4.4"
 cd /root/
 if [[ -f "goLogScythe-linux-amd64.tar.gz" ]]; then
     echo "## will remove old goLogScythe-linux-amd64.tar.gz"

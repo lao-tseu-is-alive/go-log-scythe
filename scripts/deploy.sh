@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="v0.4.2"
+VERSION="v0.4.4"
 cd /root/ || { echo "💥 💥 directory : /root/ not found, will exit"; exit 1; }
 if [[ -f "goLogScythe-linux-amd64.tar.gz" ]]; then
     echo "## will remove old goLogScythe-linux-amd64.tar.gz"
