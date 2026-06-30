@@ -368,6 +368,8 @@ sudo PREVIEW_MODE=true SCAN_ALL_MODE=true ./goLogScythe
 | `NFT_SET_NAME` | `parasites` | The name of the nftables set for IPv4 |
 | `NFT_SET_NAME_V6` | `parasites6` | The name of the nftables set for IPv6 |
 | `NFTABLES_CONF_PATH` | `/etc/nftables.conf` | Path to nftables config for CIDR range pre-check. Reloaded on SIGHUP (v0.4.2+). |
+| `NFT_PATH` | `/usr/sbin/nft` | **Absolute** path to the `nft` binary for nftables operations (avoids `$PATH` lookup for security — SonarQube go:S4036). |
+| `UFW_PATH` | `/usr/sbin/ufw` | **Absolute** path to the `ufw` binary used to import existing UFW allow rules into the safety whitelist at startup. |
 | `CACHE_CAPACITY` | `10000` | Maximum number of visitor IPs tracked simultaneously (v0.3.0+) |
 | `BURST_LIMIT` | `5` | Max 4xx hits in burst window before instant ban; set to `0` to disable (v0.4.0+) |
 | `BURST_WINDOW` | `3s` | Sliding window duration for burst counting (v0.4.0+) |
@@ -375,6 +377,20 @@ sudo PREVIEW_MODE=true SCAN_ALL_MODE=true ./goLogScythe
 | `REGEX_OVERRIDE` | `""` | Custom regex for log parsing (see [Custom Log Formats](#-custom-log-formats-regex_override)) |
 | `PREVIEW_MODE` | `false` | If true, logs actions but skips firewall commands (clears banned map on start) |
 | `SCAN_ALL_MODE` | `false` | If true, scans the entire log file at startup |
+
+---
+
+## 🖥️ Command Line Flags
+
+| Flag          | Description                              |
+|---------------|------------------------------------------|
+| `--version`   | Print version and exit (e.g. `goLogScythe v0.4.3`) |
+
+Example:
+
+```bash
+./goLogScythe --version
+```
 
 ---
 

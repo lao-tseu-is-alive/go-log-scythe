@@ -32,7 +32,7 @@ import (
 const (
 	APP                          = "goLogScythe"
 	AppSnake                     = "go-log-scythe"
-	VERSION                      = "0.4.3"
+	VERSION                      = "0.4.4"
 	REPOSITORY                   = "https://github.com/lao-tseu-is-alive/go-log-scythe"
 	defaultLogPath               = "/var/log/nginx/access.log"
 	defaultWhitelistPath         = "./whitelist.txt"
@@ -49,6 +49,8 @@ const (
 	defaultBurstWindow           = 3 * time.Second        // Sliding window for burst counting
 	defaultTailPollInterval      = 100 * time.Millisecond // Poll interval for tail -f style monitoring
 	VerySuspiciousBinProbesScore = 12.666
+	defaultNftPath               = "/usr/sbin/nft"
+	defaultUfwPath               = "/usr/sbin/ufw"
 	maxScorePerHit               = 20.0 // Maximum score any single hit can contribute
 	maxPatternLength             = 512  // Maximum regex pattern length in rules.conf
 	// Combined Log Format Regex (works for both Nginx and Apache)
@@ -207,6 +209,12 @@ var (
 	rulesMu     sync.RWMutex
 	nftRangesMu sync.RWMutex
 
+	// nftPath and ufwPath are resolved absolute paths to the external binaries.
+	// They are populated in init() from NFT_PATH / UFW_PATH (or secure defaults).
+	// Using absolute paths avoids relying on PATH lookup (addresses go:S4036).
+	nftPath string
+	ufwPath string
+
 	reLog      *regexp.Regexp
 	reOverride *regexp.Regexp
 	rules      []Rule // Loaded threat detection rules
@@ -239,6 +247,10 @@ func init() {
 		PreviewMode:      getEnvBool("PREVIEW_MODE", false),
 		ScanAllMode:      getEnvBool("SCAN_ALL_MODE", false),
 	}
+
+	// Resolve absolute paths for external tools (never rely on $PATH)
+	nftPath = getEnv("NFT_PATH", defaultNftPath)
+	ufwPath = getEnv("UFW_PATH", defaultUfwPath)
 
 	// Pre-compile Regex
 	reLog = regexp.MustCompile(defaultLogRegex)
@@ -469,7 +481,7 @@ func addIPToNFTSet(ip string, setName string) (ok, duplicate bool, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "nft", "add", "element", "inet", "filter", setName, "{", ip, "}")
+	cmd := exec.CommandContext(ctx, nftPath, "add", "element", "inet", "filter", setName, "{", ip, "}")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := strings.TrimSpace(string(output))
@@ -667,7 +679,7 @@ func loadSafetyWhitelist() {
 	}
 
 	// Import from UFW status if available
-	out, err := exec.Command("ufw", "status").Output()
+	out, err := exec.Command(ufwPath, "status").Output()
 	if err == nil {
 		reIP := regexp.MustCompile(`(\d{1,3}(?:\.\d{1,3}){3})`)
 		for _, ip := range reIP.FindAllString(string(out), -1) {

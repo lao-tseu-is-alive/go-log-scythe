@@ -5,6 +5,26 @@ All notable changes to **GoLogScythe** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-06-30
+
+### Security
+- **SonarQube go:S4036** (untrusted search path) mitigation: `nft` and `ufw` external commands no longer rely on `$PATH` resolution.
+  - Both binaries are now invoked using absolute paths with secure defaults (`/usr/sbin/nft` and `/usr/sbin/ufw`).
+  - New environment variables `NFT_PATH` and `UFW_PATH` allow overriding the paths (still expected to be absolute) for non-standard installations.
+- Introduced package variables `nftPath` / `ufwPath` resolved once during `init()` from environment or the safe defaults.
+- Updated README and example `config.env` files with documentation for the new variables.
+- **Python `scripts/evidence_summary.py`**: mitigated path traversal / arbitrary file read risk (SonarQube VULNERABILITY).
+  - User-supplied `directory` argument is now normalized with `os.path.realpath(os.path.abspath(...))`.
+  - Added runtime containment validation: only files whose real path is inside the resolved base directory are opened.
+  - Improved help text to document the safe handling.
+
+---
+
+## [0.4.3] - 2026-06-29
+
+### Added
+- Idempotent nftables set addition: `addIPToNFTSet()` now cleanly reports duplicates and treats "already exists" responses as success (no error).
+
 ---
 
 ## [0.4.2] - 2026-06-29
