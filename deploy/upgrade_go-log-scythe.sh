@@ -8,7 +8,7 @@ fi
 echo "## will check if goLogScythe release ${VERSION} is already installed"
 if [ -f "/usr/local/bin/goLogScythe-linux-amd64" ]; then
     if [ "$(/usr/local/bin/goLogScythe-linux-amd64 --version)" = "goLogScythe v${VERSION}" ]; then
-        echo "## goLogScythe release ${VERSION} is already installed"
+        echo "## goLogScythe release ${VERSION} is already installed, nothing to do !"
         exit 0
     fi
 fi
